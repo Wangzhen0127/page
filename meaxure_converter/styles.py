@@ -152,11 +152,13 @@ def layer_visual_styles(layer: Layer, unit: str = "px") -> Dict[str, str]:
     u = _px if unit == "px" else (lambda v: _rpx(v))
     styles: Dict[str, str] = {}
 
+    # Prefer numeric opacity field; ignore MeaXure measure css `opacity: 0`
     if layer.opacity is not None and abs(layer.opacity - 1.0) > 1e-6:
         styles["opacity"] = str(round(layer.opacity, 4))
 
+    transforms: List[str] = []
     if layer.rotation:
-        styles["transform"] = f"rotate({layer.rotation}deg)"
+        transforms.append(f"rotate({layer.rotation}deg)")
 
     bg, bg_image = fill_to_background(layer.fills)
     if bg:
@@ -164,13 +166,27 @@ def layer_visual_styles(layer: Layer, unit: str = "px") -> Dict[str, str]:
     if bg_image:
         styles["background-image"] = bg_image
 
-    # Prefer MeaXure-provided css snippets for backgrounds when fills empty
+    # Prefer MeaXure-provided css snippets for backgrounds / transforms
     if not bg and not bg_image:
         for line in layer.css or []:
-            low = line.lower()
+            low = line.lower().strip()
             if low.startswith("background:") or low.startswith("background-image:"):
                 key, val = line.split(":", 1)
                 styles[key.strip()] = val.strip().rstrip(";")
+            elif low.startswith("transform:"):
+                val = line.split(":", 1)[1].strip().rstrip(";")
+                # Avoid duplicating rotate already applied from rotation field
+                if "rotate" in val.lower() and layer.rotation:
+                    continue
+                transforms.append(val)
+            elif low.startswith("border-radius:"):
+                val = line.split(":", 1)[1].strip().rstrip(";")
+                if unit == "rpx":
+                    val = val.replace("px", "rpx")
+                styles["border-radius"] = val
+
+    if transforms:
+        styles["transform"] = " ".join(transforms)
 
     radius = radius_to_css(layer.radius)
     if radius:

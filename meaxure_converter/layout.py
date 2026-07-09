@@ -1,38 +1,41 @@
-"""Build a flex-oriented layout tree from flat MeaXure layers.
+"""Build a flex layout tree that preserves MeaXure coordinates 1:1.
 
 Strategy
 --------
-1. Reconstruct nesting from Sketch ``group`` bounding boxes.
-2. Among siblings, treat large containing shapes as absolute backgrounds.
-3. Flow remaining content with flex rows/columns + margin gaps.
-4. Keep slice / exportable assets absolute using original rects
-   relative to their parent container.
+Artboard is a column flex container. Every non-asset visual layer becomes a
+flex item with:
+
+    margin-top  = y - previous_bottom   (may be negative when overlapping)
+    margin-left = x
+
+This reproduces absolute coordinates using only flex + margins.
+
+Slice / exportable assets keep original absolute left/top relative to the
+artboard (素材原始定位).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .parser import Artboard, Layer, Rect
 
 
 @dataclass
 class LayoutNode:
-    kind: str  # artboard | group | row | shape | text | asset | spacer
+    kind: str  # artboard | shape | text | asset | spacer
     name: str
     rect: Rect
     layer: Optional[Layer] = None
     children: List["LayoutNode"] = field(default_factory=list)
-    # Flex flow hints relative to previous sibling in the same parent
     margin_top: float = 0.0
     margin_left: float = 0.0
-    # Absolute placement (relative to parent) for assets / backgrounds
     abs_left: Optional[float] = None
     abs_top: Optional[float] = None
-    # Row/column direction for containers
-    direction: str = "column"  # column | row
+    direction: str = "column"
     class_name: str = ""
+    z_index: int = 0
     meta: Dict[str, object] = field(default_factory=dict)
 
     @property
@@ -52,7 +55,7 @@ def _rect_area(r: Rect) -> float:
     return max(0.0, r.width) * max(0.0, r.height)
 
 
-def _almost_same_rect(a: Rect, b: Rect, tol: float = 2.0) -> bool:
+def _almost_same_rect(a: Rect, b: Rect, tol: float = 4.0) -> bool:
     return (
         abs(a.x - b.x) <= tol
         and abs(a.y - b.y) <= tol
@@ -61,408 +64,191 @@ def _almost_same_rect(a: Rect, b: Rect, tol: float = 2.0) -> bool:
     )
 
 
-def _overlap_ratio(a: Rect, b: Rect) -> float:
-    """Intersection area / min(area(a), area(b))."""
-    ox = min(a.right(), b.right()) - max(a.x, b.x)
-    oy = min(a.bottom(), b.bottom()) - max(a.y, b.y)
-    if ox <= 0 or oy <= 0:
-        return 0.0
-    inter = ox * oy
-    smaller = min(_rect_area(a), _rect_area(b))
-    if smaller <= 0:
-        return 0.0
-    return inter / smaller
+def _css_says_invisible(layer: Layer) -> bool:
+    """MeaXure marks measurement slices with `opacity: 0` in css — not real hide."""
+    for line in layer.css or []:
+        low = (line or "").lower().replace(" ", "")
+        if low.startswith("opacity:0") or low == "opacity:0;":
+            return True
+    return False
 
 
-def _x_overlap_ratio(a: Rect, b: Rect) -> float:
-    ox = min(a.right(), b.right()) - max(a.x, b.x)
-    if ox <= 0:
-        return 0.0
-    return ox / min(a.width, b.width)
+def _is_measurement_hidden(layer: Layer) -> bool:
+    """Skip Sketch measure helpers that are fully transparent rectangles."""
+    if layer.is_asset or layer.type == "text":
+        return False
+    if layer.opacity is not None and layer.opacity <= 0.01:
+        return True
+    for line in layer.css or []:
+        low = (line or "").lower().replace(" ", "")
+        if low.startswith("opacity:0"):
+            # Transparent hit-area / measure rect — not a real visual
+            return True
+    return False
 
 
-def _y_overlap_ratio(a: Rect, b: Rect) -> float:
-    oy = min(a.bottom(), b.bottom()) - max(a.y, b.y)
-    if oy <= 0:
-        return 0.0
-    return oy / min(a.height, b.height)
+def _is_complex_vector(layer: Layer) -> bool:
+    """Shapes MeaXure cannot describe with CSS alone (need preview crop)."""
+    if layer.type != "shape":
+        return False
+    name = layer.name or ""
+    if any(k in name for k in ("形状", "路径", "结合", "位图", "banner", "图片")):
+        # Simple ellipses / rounded rects named 椭圆形 are fine as CSS
+        if "椭圆" in name and "结合" not in name and "路径" not in name:
+            return False
+        return True
+    # No fill/border → must crop from preview
+    if not layer.fills and not layer.borders:
+        return True
+    return False
 
 
-def build_group_tree(artboard: Artboard) -> LayoutNode:
-    """Assign layers into nested groups by geometric containment."""
-    layers = list(artboard.layers)
-    groups = [l for l in layers if l.type == "group"]
-    groups_sorted = sorted(
-        groups,
-        key=lambda g: (-_rect_area(g.rect), g.rect.y, g.rect.x),
-    )
+def _has_visual(layer: Layer) -> bool:
+    if layer.type == "text":
+        return bool((layer.content or "").strip())
+    if layer.is_asset:
+        return True
+    if layer.type == "group":
+        return False
+    if _is_measurement_hidden(layer):
+        return False
+    if layer.fills or layer.borders or layer.shadows:
+        return True
+    for line in layer.css or []:
+        low = (line or "").lower().strip()
+        if low.startswith("background") or low.startswith("border") or low.startswith(
+            "box-shadow"
+        ):
+            return True
+    # Empty bitmap / banner placeholders — still emit so preview-crop can fill them
+    name = (layer.name or "").lower()
+    if any(k in name for k in ("位图", "banner", "图片", "image", "形状", "路径")):
+        return True
+    return False
 
+
+def _covered_by_asset(layer: Layer, assets: Sequence[Layer]) -> bool:
+    if layer.type == "text" or layer.is_asset:
+        return False
+    for asset in assets:
+        if asset.rect.contains(layer.rect, pad=3.0) or _almost_same_rect(
+            asset.rect, layer.rect, tol=4.0
+        ):
+            if _rect_area(layer.rect) <= _rect_area(asset.rect) * 1.2:
+                return True
+    return False
+
+
+def _collect_layers(
+    artboard: Artboard,
+) -> Tuple[List[Tuple[int, Layer]], List[Tuple[int, Layer]]]:
+    asset_layers = [l for l in artboard.layers if l.is_asset]
+    assets: List[Tuple[int, Layer]] = []
+    flow: List[Tuple[int, Layer]] = []
+
+    for idx, layer in enumerate(artboard.layers):
+        if layer.type == "group":
+            continue
+        if layer.is_asset:
+            assets.append((idx, layer))
+            continue
+        if not _has_visual(layer):
+            continue
+        if _covered_by_asset(layer, asset_layers):
+            continue
+        flow.append((idx, layer))
+
+    # Flex margin chain must go top→bottom
+    flow.sort(key=lambda it: (it[1].rect.y, it[1].rect.x, it[0]))
+    # Assets keep sketch paint order (bottom→top) via z-index
+    assets.sort(key=lambda it: it[0])
+    return flow, assets
+
+
+def build_layout(artboard: Artboard) -> LayoutNode:
     root = LayoutNode(
         kind="artboard",
         name=artboard.name,
         rect=Rect(0, 0, artboard.width, artboard.height),
         direction="column",
         class_name="page",
+        meta={"position_relative": True},
     )
 
-    group_nodes: Dict[str, LayoutNode] = {}
-    for g in groups_sorted:
+    flow, assets = _collect_layers(artboard)
+
+    prev_bottom = 0.0
+    for z, layer in flow:
+        kind = "text" if layer.type == "text" else "shape"
+        needs_crop = kind == "shape" and _is_complex_vector(layer)
+        meta: Dict[str, object] = {}
+        if needs_crop:
+            meta["preview_crop"] = True
+            # Avoid painting solid fill under the cropped icon
+            meta["suppress_fill"] = True
         node = LayoutNode(
-            kind="group",
-            name=g.name or "group",
-            rect=g.rect,
-            layer=g,
-            direction="column",
-            class_name="group",
+            kind=kind,
+            name=layer.name or layer.type,
+            rect=layer.rect,
+            layer=layer,
+            class_name=kind,
+            z_index=z,
+            margin_top=layer.rect.y - prev_bottom,
+            margin_left=layer.rect.x,
+            meta=meta,
         )
-        group_nodes[g.object_id] = node
+        root.children.append(node)
+        prev_bottom = layer.rect.y + layer.rect.height
 
-    for g in groups_sorted:
-        node = group_nodes[g.object_id]
-        parent: LayoutNode = root
-        best_area = _rect_area(root.rect)
-        for other in groups_sorted:
-            if other.object_id == g.object_id:
-                continue
-            if other.rect.contains(g.rect) and not _almost_same_rect(other.rect, g.rect):
-                area = _rect_area(other.rect)
-                if area < best_area:
-                    best_area = area
-                    parent = group_nodes[other.object_id]
-        parent.children.append(node)
-
-    content_layers = [l for l in layers if l.type != "group"]
-    assets = [l for l in content_layers if l.is_asset]
-    non_assets = [l for l in content_layers if not l.is_asset]
-
-    # Suppress vector shapes fully covered by an exported slice
-    suppressed: Set[str] = set()
-    for asset in assets:
-        for other in non_assets:
-            if other.type == "text":
-                continue
-            if asset.rect.contains(other.rect, pad=3.0) or _almost_same_rect(
-                asset.rect, other.rect, tol=4.0
-            ):
-                suppressed.add(other.object_id)
-
-    def find_parent(layer: Layer) -> LayoutNode:
-        parent = root
-        best_area = _rect_area(root.rect)
-        for g in groups_sorted:
-            node = group_nodes[g.object_id]
-            if g.rect.contains(layer.rect, pad=2.0):
-                area = _rect_area(g.rect)
-                if area < best_area:
-                    best_area = area
-                    parent = node
-        return parent
-
-    for layer in content_layers:
-        if layer.object_id in suppressed:
-            continue
-        parent = find_parent(layer)
-        if layer.is_asset:
-            child = LayoutNode(
-                kind="asset",
-                name=layer.name or "asset",
-                rect=layer.rect,
-                layer=layer,
-                class_name="asset",
-                abs_left=layer.rect.x - parent.rect.x,
-                abs_top=layer.rect.y - parent.rect.y,
+    # Trailing spacer so flex column height matches artboard when last
+    # content ends above the canvas bottom.
+    if prev_bottom < artboard.height - 0.5:
+        gap = artboard.height - prev_bottom
+        root.children.append(
+            LayoutNode(
+                kind="spacer",
+                name="spacer",
+                rect=Rect(0, prev_bottom, 1, gap),
+                margin_top=0.0,
+                margin_left=0.0,
+                class_name="spacer",
+                meta={"spacer": True},
             )
-        elif layer.type == "text":
-            child = LayoutNode(
-                kind="text",
-                name=layer.name or "text",
-                rect=layer.rect,
-                layer=layer,
-                class_name="text",
-            )
-        else:
-            child = LayoutNode(
-                kind="shape",
-                name=layer.name or "shape",
-                rect=layer.rect,
-                layer=layer,
-                class_name="shape",
-            )
-        parent.children.append(child)
+        )
 
-    def prune(node: LayoutNode) -> Optional[LayoutNode]:
-        node.children = [c for c in (prune(c) for c in node.children) if c]
-        if node.kind == "group" and not node.children:
-            layer = node.layer
-            has_visual = bool(
-                layer
-                and (
-                    layer.fills
-                    or layer.borders
-                    or layer.shadows
-                    or any(
-                        (line or "").lower().startswith("background")
-                        for line in (layer.css or [])
-                    )
-                )
-            )
-            if not has_visual:
-                return None
-        return node
+    for z, layer in assets:
+        node = LayoutNode(
+            kind="asset",
+            name=layer.name or "asset",
+            rect=layer.rect,
+            layer=layer,
+            class_name="asset",
+            z_index=z,
+            abs_left=layer.rect.x,
+            abs_top=layer.rect.y,
+            # Ignore MeaXure measurement `opacity: 0` on slices
+            meta={"force_visible": True},
+        )
+        root.children.append(node)
 
-    pruned = prune(root)
-    assert pruned is not None
-    return pruned
-
-
-def _extract_backgrounds(
-    parent: LayoutNode, children: List[LayoutNode]
-) -> tuple[List[LayoutNode], List[LayoutNode]]:
-    """Split children into absolute backgrounds vs flow content.
-
-    A node is a background when it contains (or heavily overlaps) other
-    siblings and is a shape/group — typical Sketch card / banner fills.
-    """
-    if len(children) <= 1:
-        return [], children
-
-    backgrounds: List[LayoutNode] = []
-    remaining = list(children)
-
-    # Largest first so outer cards become backgrounds before inner ones
-    candidates = sorted(
-        [c for c in remaining if c.kind in ("shape", "group")],
-        key=lambda n: -_rect_area(n.rect),
-    )
-
-    bg_ids: Set[int] = set()
-    for cand in candidates:
-        others = [o for o in remaining if o is not cand and id(o) not in bg_ids]
-        if not others:
-            continue
-        contained = [
-            o
-            for o in others
-            if cand.rect.contains(o.rect, pad=4.0) or _overlap_ratio(cand.rect, o.rect) > 0.7
-        ]
-        # Must contain at least one other sibling, and cover a meaningful share
-        if not contained:
-            continue
-        # Avoid treating a small icon shape as background of a nearby text
-        if _rect_area(cand.rect) < _rect_area(parent.rect) * 0.02 and len(contained) < 2:
-            # still allow if it clearly contains multiple items
-            if len(contained) < 2:
-                continue
-        cand.abs_left = cand.rect.x - parent.rect.x
-        cand.abs_top = cand.rect.y - parent.rect.y
-        cand.meta["is_background"] = True
-        backgrounds.append(cand)
-        bg_ids.add(id(cand))
-
-    flow = [c for c in remaining if id(c) not in bg_ids]
-    return backgrounds, flow
-
-
-def _are_side_by_side(a: LayoutNode, b: LayoutNode, y_tol: float = 12.0) -> bool:
-    """True when two nodes sit on one horizontal line without heavy overlap."""
-    y_overlap = _y_overlap_ratio(a.rect, b.rect)
-    x_overlap = _x_overlap_ratio(a.rect, b.rect)
-    # Similar vertical band
-    centers_close = abs((a.rect.y + a.rect.height / 2) - (b.rect.y + b.rect.height / 2)) <= max(
-        y_tol, min(a.rect.height, b.rect.height) * 0.5
-    )
-    if x_overlap > 0.35:
-        return False  # stacked / overlapping, not side-by-side
-    if y_overlap < 0.25 and not centers_close:
-        return False
-    return True
-
-
-def _cluster_rows(nodes: Sequence[LayoutNode], y_tol: float = 12.0) -> List[List[LayoutNode]]:
-    """Cluster nodes into horizontal rows; overlapping stacks stay separate."""
-    if not nodes:
-        return []
-    ordered = sorted(nodes, key=lambda n: (n.rect.y, n.rect.x))
-    rows: List[List[LayoutNode]] = []
-    for node in ordered:
-        placed = False
-        for row in rows:
-            if all(_are_side_by_side(node, existing, y_tol=y_tol) for existing in row):
-                row.append(node)
-                placed = True
-                break
-        if not placed:
-            rows.append([node])
-    for row in rows:
-        row.sort(key=lambda n: n.rect.x)
-    rows.sort(key=lambda row: min(n.rect.y for n in row))
-    return rows
-
-
-def apply_flex_flow(node: LayoutNode) -> LayoutNode:
-    """Rewrite children into flex rows/columns with margin gaps."""
-    if not node.children:
-        return node
-
-    assets = [c for c in node.children if c.kind == "asset"]
-    flow_children = [c for c in node.children if c.kind != "asset"]
-    flow_children = [apply_flex_flow(c) for c in flow_children]
-
-    backgrounds, flow_children = _extract_backgrounds(node, flow_children)
-
-    if not flow_children and not backgrounds and not assets:
-        node.children = []
-        return node
-
-    new_children: List[LayoutNode] = []
-
-    # Absolute backgrounds first (painted under content)
-    if backgrounds or assets:
-        node.meta["position_relative"] = True
-    for bg in backgrounds:
-        bg.abs_left = bg.rect.x - node.rect.x
-        bg.abs_top = bg.rect.y - node.rect.y
-        new_children.append(bg)
-
-    if flow_children:
-        rows = _cluster_rows(flow_children)
-        prev_bottom = node.rect.y
-        for row_nodes in rows:
-            row_top = min(n.rect.y for n in row_nodes)
-            row_left = min(n.rect.x for n in row_nodes)
-            row_right = max(n.rect.right() for n in row_nodes)
-            row_bottom = max(n.rect.bottom() for n in row_nodes)
-            row_rect = Rect(row_left, row_top, row_right - row_left, row_bottom - row_top)
-
-            # Overlaps previous flow content.
-            overlaps_previous = row_top + 1 < prev_bottom and prev_bottom > node.rect.y
-            if overlaps_previous:
-                overlap_amount = prev_bottom - row_top
-                row_area = (row_right - row_left) * (row_bottom - row_top)
-                # Large section blocks: keep in flex flow with negative margin
-                # so overall page height stays correct.
-                is_large_section = (
-                    (row_right - row_left) >= node.rect.width * 0.5
-                    or row_area >= _rect_area(node.rect) * 0.08
-                )
-                if is_large_section:
-                    margin_top = -overlap_amount
-                    if len(row_nodes) == 1:
-                        child = row_nodes[0]
-                        child.margin_top = margin_top
-                        child.margin_left = max(0.0, child.rect.x - node.rect.x)
-                        child.abs_left = None
-                        child.abs_top = None
-                        new_children.append(child)
-                    else:
-                        row_node = LayoutNode(
-                            kind="row",
-                            name="row",
-                            rect=row_rect,
-                            direction="row",
-                            class_name="row",
-                            margin_top=margin_top,
-                            margin_left=max(0.0, row_left - node.rect.x),
-                        )
-                        prev_x = row_left
-                        for i, child in enumerate(row_nodes):
-                            gap = max(0.0, child.rect.x - prev_x)
-                            child.margin_left = gap if i > 0 else 0.0
-                            child.margin_top = max(0.0, child.rect.y - row_top)
-                            child.abs_left = None
-                            child.abs_top = None
-                            row_node.children.append(child)
-                            prev_x = child.rect.right()
-                        new_children.append(row_node)
-                    prev_bottom = max(prev_bottom, row_bottom)
-                    continue
-
-                # Small overlays (titles on hero, badges): original absolute coords
-                for child in row_nodes:
-                    child.abs_left = child.rect.x - node.rect.x
-                    child.abs_top = child.rect.y - node.rect.y
-                    child.margin_top = 0.0
-                    child.margin_left = 0.0
-                    child.meta["overlay"] = True
-                    new_children.append(child)
-                continue
-
-            margin_top = max(0.0, row_top - prev_bottom)
-
-            if len(row_nodes) == 1:
-                child = row_nodes[0]
-                child.margin_top = margin_top
-                child.margin_left = max(0.0, child.rect.x - node.rect.x)
-                if not child.meta.get("is_background"):
-                    child.abs_left = None
-                    child.abs_top = None
-                new_children.append(child)
-            else:
-                row_node = LayoutNode(
-                    kind="row",
-                    name="row",
-                    rect=row_rect,
-                    direction="row",
-                    class_name="row",
-                    margin_top=margin_top,
-                    margin_left=max(0.0, row_left - node.rect.x),
-                )
-                prev_x = row_left
-                for i, child in enumerate(row_nodes):
-                    gap = max(0.0, child.rect.x - prev_x)
-                    child.margin_left = gap if i > 0 else 0.0
-                    child.margin_top = max(0.0, child.rect.y - row_top)
-                    child.abs_left = None
-                    child.abs_top = None
-                    row_node.children.append(child)
-                    prev_x = child.rect.right()
-                new_children.append(row_node)
-
-            prev_bottom = max(prev_bottom, row_bottom)
-
-    for asset in assets:
-        asset.abs_left = asset.rect.x - node.rect.x
-        asset.abs_top = asset.rect.y - node.rect.y
-        new_children.append(asset)
-
-    node.children = new_children
-    node.direction = "column"
-    return node
-
-
-def simplify_tree(node: LayoutNode) -> LayoutNode:
-    """Collapse useless single-child group wrappers without visuals."""
-    node.children = [simplify_tree(c) for c in node.children]
-    if (
-        node.kind == "group"
-        and len(node.children) == 1
-        and node.children[0].kind in ("group", "row")
-        and not node.is_absolute
-        and node.layer
-        and not node.layer.fills
-        and not node.layer.borders
-        and not node.layer.shadows
-    ):
-        child = node.children[0]
-        child.margin_top += node.margin_top
-        child.margin_left += node.margin_left
-        return child
-    return node
-
-
-def build_layout(artboard: Artboard) -> LayoutNode:
-    tree = build_group_tree(artboard)
-    tree = apply_flex_flow(tree)
-    tree = simplify_tree(tree)
-    return tree
+    return root
 
 
 def iter_assets(node: LayoutNode) -> List[LayoutNode]:
     out: List[LayoutNode] = []
     if node.kind == "asset":
         out.append(node)
-    for c in node.children:
-        out.extend(iter_assets(c))
+    for child in node.children:
+        out.extend(iter_assets(child))
+    return out
+
+
+def iter_preview_crops(node: LayoutNode) -> List[LayoutNode]:
+    out: List[LayoutNode] = []
+    if node.meta.get("preview_crop"):
+        out.append(node)
+    for child in node.children:
+        out.extend(iter_preview_crops(child))
     return out
 
 
@@ -476,3 +262,16 @@ def count_nodes(node: LayoutNode) -> Dict[str, int]:
 
     walk(node)
     return counts
+
+
+# Compatibility aliases
+def build_group_tree(artboard: Artboard) -> LayoutNode:
+    return build_layout(artboard)
+
+
+def apply_flex_flow(node: LayoutNode) -> LayoutNode:
+    return node
+
+
+def simplify_tree(node: LayoutNode) -> LayoutNode:
+    return node

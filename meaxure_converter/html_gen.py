@@ -10,18 +10,11 @@ from typing import Dict, List, Optional, Set
 
 from .layout import LayoutNode, iter_assets
 from .parser import Artboard, MeaXureDocument
+from .preview_crop import crop_preview_layers
 from .styles import decls_to_css, layer_visual_styles, _px
 
 
-def _slugify(name: str) -> str:
-    name = name.strip().lower()
-    name = re.sub(r"[^\w\u4e00-\u9fff]+", "-", name, flags=re.UNICODE)
-    name = re.sub(r"-{2,}", "-", name).strip("-")
-    return name or "page"
-
-
 def _safe_asset_filename(path: str) -> str:
-    # Keep original basename; sanitize only path separators
     base = Path(path).name
     return base.replace("\\", "_").replace("/", "_")
 
@@ -32,7 +25,6 @@ class ClassRegistry:
         self._counter = 0
 
     def add(self, prefix: str, decls: Dict[str, str]) -> str:
-        # Reuse identical rule sets
         key = decls_to_css(decls)
         for name, existing in self._rules.items():
             if decls_to_css(existing) == key and name.startswith(prefix):
@@ -68,6 +60,22 @@ def _flow_decls(node: LayoutNode) -> Dict[str, str]:
     return decls
 
 
+def _absolute_decls(node: LayoutNode) -> Dict[str, str]:
+    if not node.is_absolute:
+        return {}
+    return {
+        "position": "absolute",
+        "left": _px(node.abs_left or 0),
+        "top": _px(node.abs_top or 0),
+    }
+
+
+def _z_decls(node: LayoutNode) -> Dict[str, str]:
+    if node.z_index:
+        return {"z-index": str(node.z_index)}
+    return {}
+
+
 def render_node_html(
     node: LayoutNode,
     registry: ClassRegistry,
@@ -78,19 +86,24 @@ def render_node_html(
     if node.kind == "text":
         return _render_text(node, registry)
     if node.kind == "shape":
-        return _render_shape(node, registry)
-    # containers: artboard, group, row
+        return _render_shape(node, registry, asset_url_prefix)
+    if node.kind == "spacer":
+        return _render_spacer(node, registry)
     return _render_container(node, registry, asset_url_prefix)
 
 
-def _absolute_decls(node: LayoutNode) -> Dict[str, str]:
-    if not node.is_absolute:
-        return {}
-    return {
-        "position": "absolute",
-        "left": _px(node.abs_left or 0),
-        "top": _px(node.abs_top or 0),
+def _render_spacer(node: LayoutNode, registry: ClassRegistry) -> str:
+    decls = {
+        "width": "1px",
+        "height": _px(node.height),
+        "flex-shrink": "0",
+        "opacity": "0",
+        "pointer-events": "none",
     }
+    if node.margin_top:
+        decls["margin-top"] = _px(node.margin_top)
+    cls = registry.add("spacer", decls)
+    return f'<div class="{cls}" aria-hidden="true"></div>'
 
 
 def _render_asset(node: LayoutNode, registry: ClassRegistry, prefix: str) -> str:
@@ -107,10 +120,16 @@ def _render_asset(node: LayoutNode, registry: ClassRegistry, prefix: str) -> str
         "width": _px(node.width),
         "height": _px(node.height),
         "display": "block",
-        "object-fit": "contain",
+        "object-fit": "fill",
         "pointer-events": "none",
     }
-    if layer.opacity is not None and abs(layer.opacity - 1) > 1e-6:
+    decls.update(_z_decls(node))
+    # Slice css often has opacity:0 (MeaXure measure). Prefer layer.opacity field.
+    if (
+        not node.meta.get("force_visible")
+        and layer.opacity is not None
+        and abs(layer.opacity - 1) > 1e-6
+    ):
         decls["opacity"] = str(round(layer.opacity, 4))
     if layer.rotation:
         decls["transform"] = f"rotate({layer.rotation}deg)"
@@ -128,14 +147,18 @@ def _render_text(node: LayoutNode, registry: ClassRegistry) -> str:
     else:
         decls.update(_flow_decls(node))
     decls.update(layer_visual_styles(layer, unit="px"))
+    decls.update(_z_decls(node))
     decls.setdefault("display", "flex")
     decls.setdefault("align-items", "center")
+    decls["position"] = "relative"
     cls = registry.add("text", decls)
-    content = html.escape(layer.content or "")
+    content = html.escape(layer.content or "").replace("\n", "<br />")
     return f'<div class="{cls}">{content}</div>'
 
 
-def _render_shape(node: LayoutNode, registry: ClassRegistry) -> str:
+def _render_shape(
+    node: LayoutNode, registry: ClassRegistry, prefix: str
+) -> str:
     layer = node.layer
     assert layer is not None
     decls = _size_decls(node)
@@ -143,8 +166,28 @@ def _render_shape(node: LayoutNode, registry: ClassRegistry) -> str:
         decls.update(_absolute_decls(node))
     else:
         decls.update(_flow_decls(node))
-    decls.update(layer_visual_styles(layer, unit="px"))
+    if not node.meta.get("suppress_fill"):
+        decls.update(layer_visual_styles(layer, unit="px"))
+    else:
+        # Keep opacity / transform / radius without solid fill under crop
+        styles = layer_visual_styles(layer, unit="px")
+        for k in ("opacity", "transform", "border-radius"):
+            if k in styles:
+                decls[k] = styles[k]
+    decls.update(_z_decls(node))
+    decls["position"] = "relative"
     decls.setdefault("display", "block")
+    decls["overflow"] = "hidden"
+
+    crop_src = node.meta.get("crop_src")
+    if crop_src:
+        decls["background-image"] = f'url("{prefix.rstrip("/")}/{crop_src}")'
+        decls["background-size"] = "100% 100%"
+        decls["background-repeat"] = "no-repeat"
+        decls.pop("background", None)
+        cls = registry.add("shape", decls)
+        return f'<div class="{cls}" title="{html.escape(layer.name or "")}"></div>'
+
     cls = registry.add("shape", decls)
     return f'<div class="{cls}" title="{html.escape(layer.name or "")}"></div>'
 
@@ -162,12 +205,12 @@ def _render_container(
     if node.kind == "artboard":
         decls["width"] = _px(node.width)
         decls["min-height"] = _px(node.height)
+        decls["height"] = _px(node.height)
         decls["margin"] = "0 auto"
         decls["overflow"] = "hidden"
-        decls["background"] = "#ffffff"
+        decls["background"] = "#EFF4FB"
     else:
         decls["width"] = _px(node.width)
-        # For rows, height from content; keep explicit for fidelity
         decls["height"] = _px(node.height)
         if node.is_absolute:
             decls.update(_absolute_decls(node))
@@ -177,20 +220,16 @@ def _render_container(
     if node.layer:
         decls.update(layer_visual_styles(node.layer, unit="px"))
 
-    if (
-        node.meta.get("position_relative")
-        or any(c.kind == "asset" or c.is_absolute for c in node.children)
-    ):
-        decls["position"] = "relative"
-
+    decls["position"] = "relative"
     prefix_name = {"artboard": "page", "group": "group", "row": "row"}.get(
         node.kind, "box"
     )
     cls = registry.add(prefix_name, decls)
-    inner = "\n".join(
-        render_node_html(child, registry, prefix) for child in node.children
-    )
-    # Indent children lightly
+    # Paint order: flow first (document order), assets last so they overlay
+    flow = [c for c in node.children if c.kind != "asset"]
+    assets = [c for c in node.children if c.kind == "asset"]
+    ordered = flow + assets
+    inner = "\n".join(render_node_html(child, registry, prefix) for child in ordered)
     if inner:
         inner = "\n".join("  " + line for line in inner.splitlines())
         return f'<div class="{cls}">\n{inner}\n</div>'
@@ -214,11 +253,12 @@ def generate_html_page(
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
   <title>{page_title}</title>
   <style>
-* {{ margin: 0; padding: 0; }}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
 html, body {{
   background: #f5f5f5;
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
 }}
+img {{ max-width: none; }}
 {css}
   </style>
 </head>
@@ -234,7 +274,6 @@ def copy_assets(
     tree: LayoutNode,
     dest_assets: Path,
 ) -> List[str]:
-    """Copy referenced slice assets into dest_assets. Returns copied filenames."""
     dest_assets.mkdir(parents=True, exist_ok=True)
     src_dir = doc.assets_dir
     copied: List[str] = []
@@ -250,29 +289,14 @@ def copy_assets(
                 continue
             seen.add(fname)
             src = src_dir / exp.path
-            # MeaXure may store under assets/ with original path
             if not src.exists():
-                # try basename only
                 alt = src_dir / Path(exp.path).name
                 src = alt if alt.exists() else src
             if src.exists():
-                target = dest_assets / fname
-                shutil.copy2(src, target)
+                shutil.copy2(src, dest_assets / fname)
                 copied.append(fname)
             else:
                 missing.append(exp.path)
-                # Write a tiny placeholder SVG so layout still loads
-                placeholder = dest_assets / fname
-                if not placeholder.suffix:
-                    placeholder = dest_assets / (fname + ".svg")
-                if placeholder.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
-                    # skip binary placeholder; create empty file marker
-                    placeholder.write_bytes(b"")
-                else:
-                    placeholder.write_text(
-                        '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>',
-                        encoding="utf-8",
-                    )
     if missing:
         (dest_assets / "_missing_assets.txt").write_text(
             "\n".join(missing), encoding="utf-8"
@@ -290,6 +314,7 @@ def export_html(
     out_dir.mkdir(parents=True, exist_ok=True)
     assets_dir = out_dir / "assets"
     copy_assets(doc, tree, assets_dir)
+    crop_preview_layers(doc, artboard, tree, assets_dir)
     html_text = generate_html_page(artboard, tree, asset_url_prefix="./assets")
     out_file = out_dir / "index.html"
     out_file.write_text(html_text, encoding="utf-8")

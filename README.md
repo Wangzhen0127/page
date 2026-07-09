@@ -9,11 +9,11 @@
 
 | 类型 | 定位方式 |
 |------|----------|
-| 结构层（文本、卡片、分组、行列） | **Flex + margin** 还原间距，不用 absolute 铺满整页 |
-| 切片素材（slice / exportable） | **原始坐标 absolute**（相对父容器） |
-| 背景底板（被其它层包含的大色块） | absolute，作为父级背景 |
+| 结构层（文本、矩形、椭圆等） | 画板为 **column flex**；每层 `margin-top = y - prev_bottom`（可负）、`margin-left = x`，用弹性布局还原绝对坐标 |
+| 切片素材（slice / exportable） | **原始坐标 absolute**（相对画板） |
+| 复杂矢量 / 位图占位 | 从 MeaXure `preview/@2x` 按 rect **裁切**补全（CSS 无法表达的路径） |
 
-目标：视觉位置尽量 1:1，同时结构可维护。
+目标：视觉位置尽量 1:1；结构层不用 absolute，素材保留原始定位。
 
 ## 输入要求
 
