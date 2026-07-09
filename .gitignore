@@ -9,6 +9,5 @@ venv/
 output/
 .DS_Store
 .pytest_cache/
-*.webp
-*.png
+
 !samples/**
