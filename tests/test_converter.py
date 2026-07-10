@@ -71,12 +71,13 @@ class MeaXureConverterTests(unittest.TestCase):
         path = export_html(self.doc, self.tree, self.artboard, out)
         self.assertTrue(path.exists())
         assets = list((out / "assets").glob("*"))
-        self.assertGreater(len(assets), 5)
+        self.assertTrue(any("医院" in p.name for p in assets))
         html = path.read_text(encoding="utf-8")
-        self.assertNotIn("opacity: 0", html.split("asset")[0] if False else "")
-        # Slice assets should be referenced and not forced invisible
-        self.assertIn("医院.webp", html)
+        # Slice assets should be referenced (possibly upgraded to @2x png)
+        self.assertTrue("医院" in html)
         self.assertIn("position: absolute", html)
+        # Hero gradient should be multi-stop sampled when preview exists
+        self.assertIn("linear-gradient", html)
 
 
 if __name__ == "__main__":

@@ -92,13 +92,55 @@ def _is_complex_vector(layer: Layer) -> bool:
     if layer.type != "shape":
         return False
     name = layer.name or ""
-    if any(k in name for k in ("形状", "路径", "结合", "位图", "banner", "图片")):
+    if any(k in name for k in ("形状", "路径", "结合", "位图", "banner", "图片", "蒙版")):
         # Simple ellipses / rounded rects named 椭圆形 are fine as CSS
-        if "椭圆" in name and "结合" not in name and "路径" not in name:
+        if "椭圆" in name and "结合" not in name and "路径" not in name and "蒙版" not in name:
             return False
         return True
     # No fill/border → must crop from preview
     if not layer.fills and not layer.borders:
+        return True
+    # Gradient borders cannot be expressed accurately in CSS
+    for b in layer.borders or []:
+        if b.get("fillType") == "Gradient":
+            return True
+    # Translucent / multi-stop / diagonal gradients → crop for pixel fidelity
+    for f in layer.fills or []:
+        if f.get("fillType") != "Gradient":
+            continue
+        grad = f.get("gradient") or {}
+        stops = grad.get("colorStops") or []
+        if len(stops) != 2:
+            return True
+        for s in stops:
+            try:
+                if float((s.get("color") or {}).get("alpha", 255)) < 250:
+                    return True
+            except (TypeError, ValueError):
+                return True
+        frm = grad.get("from") or {}
+        to = grad.get("to") or {}
+        dx = abs(float(to.get("x", 0.5)) - float(frm.get("x", 0.5)))
+        dy = abs(float(to.get("y", 1)) - float(frm.get("y", 0)))
+        if dx > 0.08 and dy > 0.08:
+            return True
+    return False
+
+
+def _needs_preview_crop(layer: Layer) -> bool:
+    if layer.type != "shape":
+        return False
+    # Large surfaces must stay as CSS (sampled gradients) — cropping would
+    # bake overlapping text/icons into the background.
+    if layer.rect.width >= 200 or layer.rect.height >= 200:
+        # Still crop empty bitmaps / banners with no CSS fill
+        name = layer.name or ""
+        if any(k in name for k in ("位图", "banner", "图片")) and not layer.fills:
+            return True
+        if _is_complex_vector(layer) and not layer.fills and not layer.borders:
+            return True
+        return False
+    if _is_complex_vector(layer):
         return True
     return False
 
@@ -180,7 +222,7 @@ def build_layout(artboard: Artboard) -> LayoutNode:
     prev_bottom = 0.0
     for z, layer in flow:
         kind = "text" if layer.type == "text" else "shape"
-        needs_crop = kind == "shape" and _is_complex_vector(layer)
+        needs_crop = kind == "shape" and _needs_preview_crop(layer)
         meta: Dict[str, object] = {}
         if needs_crop:
             meta["preview_crop"] = True
@@ -217,6 +259,16 @@ def build_layout(artboard: Artboard) -> LayoutNode:
         )
 
     for z, layer in assets:
+        # Deduplicate slices that share nearly the same rect (png + webp twins)
+        dup = False
+        for prev_z, prev_layer in assets:
+            if prev_z >= z:
+                break
+            if _almost_same_rect(prev_layer.rect, layer.rect, tol=2.0):
+                dup = True
+                break
+        if dup:
+            continue
         node = LayoutNode(
             kind="asset",
             name=layer.name or "asset",

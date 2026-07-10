@@ -39,7 +39,7 @@ def gradient_to_css(gradient: Dict[str, Any]) -> Optional[str]:
         stop_parts.append(f"{color_to_css(stop.get('color'))} {pos:.2f}%")
     stop_css = ", ".join(stop_parts)
     if gtype == "radial":
-        return f"radial-gradient(circle, {stop_css})"
+        return f"radial-gradient(circle at center, {stop_css})"
     # Approximate angle from from/to points in unit space
     frm = gradient.get("from") or {"x": 0.5, "y": 0}
     to = gradient.get("to") or {"x": 0.5, "y": 1}
@@ -48,6 +48,15 @@ def gradient_to_css(gradient: Dict[str, Any]) -> Optional[str]:
     import math
 
     angle = (math.degrees(math.atan2(dx, -dy)) + 360) % 360
+    # Use explicit side keywords for common axis-aligned cases (better browser match)
+    if abs(dx) < 0.02 and dy > 0.5:
+        return f"linear-gradient(to bottom, {stop_css})"
+    if abs(dx) < 0.02 and dy < -0.5:
+        return f"linear-gradient(to top, {stop_css})"
+    if abs(dy) < 0.02 and dx > 0.5:
+        return f"linear-gradient(to right, {stop_css})"
+    if abs(dy) < 0.02 and dx < -0.5:
+        return f"linear-gradient(to left, {stop_css})"
     return f"linear-gradient({angle:.2f}deg, {stop_css})"
 
 
@@ -216,7 +225,13 @@ def layer_visual_styles(layer: Layer, unit: str = "px") -> Dict[str, str]:
 
     if layer.type == "text":
         if layer.font_face:
-            styles["font-family"] = layer.font_face
+            # Expand Sketch face names to a practical stack
+            face = layer.font_face
+            styles["font-family"] = (
+                f'"{face}", "PingFang SC", "Hiragino Sans GB", '
+                f'"WenQuanYi Micro Hei", "Droid Sans Fallback", '
+                f'"Microsoft YaHei", sans-serif'
+            )
         if layer.font_size is not None:
             styles["font-size"] = u(layer.font_size)
         if layer.color:
@@ -227,6 +242,14 @@ def layer_visual_styles(layer: Layer, unit: str = "px") -> Dict[str, str]:
             styles["letter-spacing"] = u(layer.letter_spacing)
         if layer.line_height:
             styles["line-height"] = u(layer.line_height)
+        elif (
+            layer.font_size is not None
+            and layer.rect.height
+            and "\n" not in (layer.content or "")
+            and layer.rect.height <= layer.font_size * 1.8
+        ):
+            # Single-line labels: match design box height
+            styles["line-height"] = u(layer.rect.height)
         weight = font_weight_from_css(layer.css, layer.font_face)
         if weight:
             styles["font-weight"] = weight

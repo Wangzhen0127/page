@@ -7,10 +7,9 @@ import re
 from pathlib import Path
 from typing import Dict
 
-from .html_gen import ClassRegistry, _safe_asset_filename, copy_assets
+from .html_gen import ClassRegistry, _safe_asset_filename, _apply_enhancements
 from .layout import LayoutNode
 from .parser import Artboard, MeaXureDocument
-from .preview_crop import crop_preview_layers
 from .styles import layer_visual_styles, _rpx
 
 
@@ -91,7 +90,10 @@ def _render_asset(node: LayoutNode, registry: ClassRegistry, prefix: str) -> str
     assert layer is not None
     asset = layer.primary_asset
     src = ""
-    if asset:
+    override = node.meta.get("asset_src")
+    if override:
+        src = f"{prefix.rstrip('/')}/{override}"
+    elif asset:
         src = f"{prefix.rstrip('/')}/{_safe_asset_filename(asset.path)}"
     decls = {
         "position": "absolute",
@@ -144,6 +146,10 @@ def _render_shape(
         decls.update(_flow_decls_rpx(node))
     if not node.meta.get("suppress_fill"):
         decls.update(layer_visual_styles(layer, unit="rpx"))
+        sampled = node.meta.get("sampled_gradient")
+        if sampled:
+            decls["background-image"] = str(sampled)
+            decls.pop("background", None)
     else:
         styles = layer_visual_styles(layer, unit="rpx")
         for k in ("opacity", "transform", "border-radius"):
@@ -262,8 +268,7 @@ def export_miniprogram(
     pages_dir = out_dir / "pages" / page_name
     pages_dir.mkdir(parents=True, exist_ok=True)
     assets_dir = out_dir / "assets"
-    copy_assets(doc, tree, assets_dir)
-    crop_preview_layers(doc, artboard, tree, assets_dir)
+    _apply_enhancements(doc, artboard, tree, assets_dir)
 
     files = generate_miniprogram_files(
         artboard, tree, page_name=page_name, asset_url_prefix="/assets"

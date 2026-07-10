@@ -10,7 +10,8 @@ from typing import Dict, List, Optional, Set
 
 from .layout import LayoutNode, iter_assets
 from .parser import Artboard, MeaXureDocument
-from .preview_crop import crop_preview_layers
+from .preview_crop import crop_preview_layers, upgrade_assets_from_preview
+from .gradient_sample import apply_sampled_gradients
 from .styles import decls_to_css, layer_visual_styles, _px
 
 
@@ -111,7 +112,10 @@ def _render_asset(node: LayoutNode, registry: ClassRegistry, prefix: str) -> str
     assert layer is not None
     asset = layer.primary_asset
     src = ""
-    if asset:
+    override = node.meta.get("asset_src")
+    if override:
+        src = f"{prefix.rstrip('/')}/{override}"
+    elif asset:
         src = f"{prefix.rstrip('/')}/{_safe_asset_filename(asset.path)}"
     decls = {
         "position": "absolute",
@@ -168,6 +172,10 @@ def _render_shape(
         decls.update(_flow_decls(node))
     if not node.meta.get("suppress_fill"):
         decls.update(layer_visual_styles(layer, unit="px"))
+        sampled = node.meta.get("sampled_gradient")
+        if sampled:
+            decls["background-image"] = str(sampled)
+            decls.pop("background", None)
     else:
         # Keep opacity / transform / radius without solid fill under crop
         styles = layer_visual_styles(layer, unit="px")
@@ -185,6 +193,10 @@ def _render_shape(
         decls["background-size"] = "100% 100%"
         decls["background-repeat"] = "no-repeat"
         decls.pop("background", None)
+        # Drop CSS border when using a pixel-perfect crop
+        for k in list(decls):
+            if k.startswith("border"):
+                decls.pop(k, None)
         cls = registry.add("shape", decls)
         return f'<div class="{cls}" title="{html.escape(layer.name or "")}"></div>'
 
@@ -256,7 +268,11 @@ def generate_html_page(
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 html, body {{
   background: #f5f5f5;
-  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+  font-family: "PingFang SC", "PingFangSC-Regular", "Hiragino Sans GB",
+    "WenQuanYi Micro Hei", "Droid Sans Fallback", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: geometricPrecision;
 }}
 img {{ max-width: none; }}
 {css}
@@ -304,6 +320,29 @@ def copy_assets(
     return copied
 
 
+def _apply_enhancements(
+    doc: MeaXureDocument,
+    artboard: Artboard,
+    tree: LayoutNode,
+    assets_dir: Path,
+) -> None:
+    """Preview-based fidelity upgrades shared by HTML / miniprogram export."""
+    copy_assets(doc, tree, assets_dir)
+    crop_preview_layers(doc, artboard, tree, assets_dir)
+    upgrade_assets_from_preview(doc, artboard, tree, assets_dir)
+
+    sampled = apply_sampled_gradients(doc, artboard, artboard.layers)
+    if sampled:
+
+        def walk(n: LayoutNode) -> None:
+            if n.layer and n.layer.object_id in sampled and not n.meta.get("crop_src"):
+                n.meta["sampled_gradient"] = sampled[n.layer.object_id]
+            for c in n.children:
+                walk(c)
+
+        walk(tree)
+
+
 def export_html(
     doc: MeaXureDocument,
     tree: LayoutNode,
@@ -313,8 +352,7 @@ def export_html(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     assets_dir = out_dir / "assets"
-    copy_assets(doc, tree, assets_dir)
-    crop_preview_layers(doc, artboard, tree, assets_dir)
+    _apply_enhancements(doc, artboard, tree, assets_dir)
     html_text = generate_html_page(artboard, tree, asset_url_prefix="./assets")
     out_file = out_dir / "index.html"
     out_file.write_text(html_text, encoding="utf-8")
