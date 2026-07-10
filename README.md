@@ -12,6 +12,9 @@
 | 结构层（文本、矩形、椭圆等） | 画板为 **column flex**；每层 `margin-top = y - prev_bottom`（可负）、`margin-left = x`，用弹性布局还原绝对坐标 |
 | 切片素材（slice / exportable） | **原始坐标 absolute**（相对画板） |
 | 复杂矢量 / 位图占位 | 从 MeaXure `preview/@2x` 按 rect **裁切**补全（CSS 无法表达的路径） |
+| 不透明线性渐变 | 从 preview **多段采样**生成 CSS（24 stops），逼近 Sketch 渲染 |
+| 半透明玻璃渐变 | 保留原始 rgba stops，避免错误合成 |
+| 1x 切片图标 | Lanczos 放大为 `@2x` PNG，保留透明通道 |
 
 目标：视觉位置尽量 1:1；结构层不用 absolute，素材保留原始定位。
 
