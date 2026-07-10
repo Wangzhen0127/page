@@ -20,9 +20,9 @@ from .fidelity import (
     resolve_preview_path,
     slugify_page,
 )
-from .html_gen import export_html
-from .layout import build_layout, count_nodes
-from .miniprogram_gen import export_miniprogram
+from .html_gen import _apply_enhancements, generate_html_page
+from .layout import build_layout, count_nodes, summarize_render_stats
+from .miniprogram_gen import export_miniprogram, generate_miniprogram_files
 from .parser import dump_document_summary, parse_meaxure_html
 
 
@@ -32,9 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Convert Sketch MeaXure Web Export HTML into native HTML "
             "and/or WeChat Mini Program pages. "
-            "Default mode `fidelity` emits ONE page per artboard using the "
-            "MeaXure preview image for pixel-accurate visuals; slice assets "
-            "are copied alongside for development."
+            "Default mode `hybrid` rebuilds editable DOM (text/colors/shapes) "
+            "with local absolute overlays; preview crops only for tiny hard "
+            "vectors. Use `fidelity` for full-page preview snapshots."
         ),
     )
     p.add_argument(
@@ -71,11 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mode",
-        choices=("fidelity", "flex"),
-        default="fidelity",
+        choices=("hybrid", "flex", "fidelity"),
+        default="hybrid",
         help=(
-            "fidelity = preview 1:1 per artboard (recommended); "
-            "flex = reconstruct layers with flex+margins"
+            "hybrid = editable CSS/DOM reconstruction (default); "
+            "flex = legacy flat margin chain; "
+            "fidelity = full-page preview image per artboard"
         ),
     )
     p.add_argument(
@@ -128,6 +129,13 @@ def _unique_slugs(doc, indices: list[int]) -> dict[int, str]:
     return out
 
 
+def _mp_page_name(slug: str, index: int) -> str:
+    page_name = re.sub(r"[^\w]+", "_", slug)[:40] or f"p{index}"
+    if page_name[0].isdigit():
+        page_name = f"p_{page_name}"
+    return page_name
+
+
 def export_fidelity_all(
     doc,
     indices: list[int],
@@ -163,10 +171,8 @@ def export_fidelity_all(
             html_dir = out / "html"
             pages_dir = html_dir / "pages"
             pages_dir.mkdir(parents=True, exist_ok=True)
-            # shared assets at html/assets
             html_assets = html_dir / "assets"
             html_assets.mkdir(parents=True, exist_ok=True)
-            # sync newly added files
             for f in shared_assets.iterdir():
                 target = html_assets / f.name
                 if f.is_file() and not target.exists():
@@ -188,10 +194,7 @@ def export_fidelity_all(
 
         if fmt in ("miniprogram", "both"):
             mp_dir = out / "miniprogram"
-            page_name = re.sub(r"[^\w]+", "_", slug)[:40] or f"p{i}"
-            # avoid leading digits for safety
-            if page_name[0].isdigit():
-                page_name = f"p_{page_name}"
+            page_name = _mp_page_name(slug, i)
             pages_dir = mp_dir / "pages" / page_name
             pages_dir.mkdir(parents=True, exist_ok=True)
             mp_assets = mp_dir / "assets"
@@ -270,10 +273,187 @@ def export_fidelity_all(
         )
 
 
+def export_hybrid_all(
+    doc,
+    indices: list[int],
+    out: Path,
+    *,
+    fmt: str,
+    with_scaffold: bool,
+    legacy_flex: bool = False,
+) -> None:
+    """Export editable reconstructed pages (one per artboard)."""
+    slugs = _unique_slugs(doc, indices)
+    shared_assets = out / "assets"
+    shared_assets.mkdir(parents=True, exist_ok=True)
+
+    gallery_pages: list[tuple[str, str, str]] = []
+    mp_pages: list[str] = []
+    totals = {
+        "text": 0,
+        "css_shape": 0,
+        "asset": 0,
+        "preview_crop": 0,
+        "containers": 0,
+    }
+
+    for i in indices:
+        ab = doc.artboards[i]
+        slug = slugs[i]
+        tree = build_layout(ab, doc.slices)
+        stats = summarize_render_stats(tree)
+        for k, v in stats.items():
+            totals[k] = totals.get(k, 0) + v
+        print(
+            f"[{i}] {ab.name} ({ab.width:.0f}x{ab.height:.0f}) → {slug} "
+            f"nodes={count_nodes(tree)} stats={stats}"
+        )
+
+        # Per-artboard temp assets then merge into shared
+        work = out / "_work" / slug
+        if work.exists():
+            shutil.rmtree(work)
+        work.mkdir(parents=True, exist_ok=True)
+        work_assets = work / "assets"
+        _apply_enhancements(doc, ab, tree, work_assets)
+
+        # Copy work assets into shared
+        for f in work_assets.iterdir() if work_assets.exists() else []:
+            if f.is_file():
+                target = shared_assets / f.name
+                if not target.exists():
+                    shutil.copy2(f, target)
+
+        if fmt in ("html", "both"):
+            html_dir = out / "html"
+            pages_dir = html_dir / "pages"
+            pages_dir.mkdir(parents=True, exist_ok=True)
+            html_assets = html_dir / "assets"
+            html_assets.mkdir(parents=True, exist_ok=True)
+            for f in shared_assets.iterdir():
+                target = html_assets / f.name
+                if f.is_file() and not target.exists():
+                    shutil.copy2(f, target)
+
+            page_html = generate_html_page(
+                ab, tree, title=f"{ab.name} · {slug}", asset_url_prefix="../assets"
+            )
+            page_file = pages_dir / f"{slug}.html"
+            page_file.write_text(page_html, encoding="utf-8")
+            gallery_pages.append((f"./pages/{slug}.html", f"{ab.name} ({slug})", ""))
+            print(f"  HTML → {page_file}")
+
+        if fmt in ("miniprogram", "both"):
+            mp_dir = out / "miniprogram"
+            page_name = _mp_page_name(slug, i)
+            pages_dir = mp_dir / "pages" / page_name
+            pages_dir.mkdir(parents=True, exist_ok=True)
+            mp_assets = mp_dir / "assets"
+            mp_assets.mkdir(parents=True, exist_ok=True)
+            for f in shared_assets.iterdir():
+                target = mp_assets / f.name
+                if f.is_file() and not target.exists():
+                    shutil.copy2(f, target)
+
+            files = generate_miniprogram_files(
+                ab, tree, page_name=page_name, asset_url_prefix="/assets"
+            )
+            for fname, content in files.items():
+                (pages_dir / fname).write_text(content, encoding="utf-8")
+            mp_pages.append(f"pages/{page_name}/{page_name}")
+            print(f"  Mini Program → {pages_dir}")
+
+        shutil.rmtree(work, ignore_errors=True)
+
+    # Cleanup work root
+    work_root = out / "_work"
+    if work_root.exists():
+        shutil.rmtree(work_root, ignore_errors=True)
+
+    code_layers = totals.get("text", 0) + totals.get("css_shape", 0)
+    visual = code_layers + totals.get("asset", 0) + totals.get("preview_crop", 0)
+    if visual:
+        print(
+            "render mix: "
+            f"code={code_layers}/{visual} "
+            f"assets={totals.get('asset', 0)} "
+            f"crops={totals.get('preview_crop', 0)} "
+            f"containers={totals.get('containers', 0)}"
+        )
+
+    if fmt in ("html", "both") and gallery_pages:
+        gallery = build_gallery_index(
+            gallery_pages,
+            title=doc.source_path.parent.name or "MeaXure Export",
+        )
+        (out / "html" / "index.html").write_text(gallery, encoding="utf-8")
+        print(f"gallery → {out / 'html' / 'index.html'}")
+
+    if fmt in ("miniprogram", "both") and mp_pages and with_scaffold:
+        mp_dir = out / "miniprogram"
+        first_title = doc.artboards[indices[0]].name
+        first_bg = "#EFF4FB"
+        try:
+            first_tree = build_layout(doc.artboards[indices[0]], doc.slices)
+            first_bg = str(first_tree.meta.get("background") or first_bg)
+        except Exception:  # noqa: BLE001
+            pass
+        (mp_dir / "app.js").write_text("App({});\n", encoding="utf-8")
+        (mp_dir / "app.json").write_text(
+            json.dumps(
+                {
+                    "pages": mp_pages,
+                    "window": {
+                        "navigationBarTitleText": first_title,
+                        "navigationBarBackgroundColor": "#ffffff",
+                        "navigationBarTextStyle": "black",
+                        "backgroundColor": first_bg,
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (mp_dir / "app.wxss").write_text(
+            f"page {{ background: {first_bg}; }}\n", encoding="utf-8"
+        )
+        (mp_dir / "project.config.json").write_text(
+            json.dumps(
+                {
+                    "description": "MeaXure hybrid export",
+                    "packOptions": {"ignore": []},
+                    "setting": {
+                        "urlCheck": False,
+                        "es6": True,
+                        "postcss": True,
+                        "minified": True,
+                    },
+                    "compileType": "miniprogram",
+                    "appid": "touristappid",
+                    "projectname": "meaxure-hybrid",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (mp_dir / "sitemap.json").write_text(
+            json.dumps({"rules": [{"action": "allow", "page": "*"}]}, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+
+
 def export_flex_one(doc, artboard, out: Path, fmt: str, with_scaffold: bool) -> None:
-    tree = build_layout(artboard)
-    print(f"layout nodes: {count_nodes(tree)}")
+    """Legacy single-artboard flex export (flat margin chain via same builder)."""
+    tree = build_layout(artboard, doc.slices)
+    print(f"layout nodes: {count_nodes(tree)} stats={summarize_render_stats(tree)}")
     if fmt in ("html", "both"):
+        from .html_gen import export_html
+
         path = export_html(doc, tree, artboard, out / "html")
         print(f"HTML → {path}")
     if fmt in ("miniprogram", "both"):
@@ -366,9 +546,10 @@ def main(argv: list[str] | None = None) -> int:
             fmt=args.format,
             with_scaffold=not args.no_scaffold,
         )
-    else:
-        # flex mode: if multiple selected, export each into subfolders
-        if len(indices) == 1:
+    elif args.mode in ("hybrid", "flex"):
+        # Both hybrid and flex now use the spatial tree builder; flex keeps
+        # the old single-folder layout when only one artboard is selected.
+        if args.mode == "flex" and len(indices) == 1:
             export_flex_one(
                 doc,
                 doc.artboards[indices[0]],
@@ -377,18 +558,17 @@ def main(argv: list[str] | None = None) -> int:
                 with_scaffold=not args.no_scaffold,
             )
         else:
-            slugs = _unique_slugs(doc, indices)
-            for i in indices:
-                sub = out / slugs[i]
-                sub.mkdir(parents=True, exist_ok=True)
-                print(f"--- flex {slugs[i]} ---")
-                export_flex_one(
-                    doc,
-                    doc.artboards[i],
-                    sub,
-                    args.format,
-                    with_scaffold=not args.no_scaffold,
-                )
+            export_hybrid_all(
+                doc,
+                indices,
+                out,
+                fmt=args.format,
+                with_scaffold=not args.no_scaffold,
+                legacy_flex=(args.mode == "flex"),
+            )
+    else:
+        print(f"error: unknown mode {args.mode}", file=sys.stderr)
+        return 1
 
     assets_hint = doc.assets_dir
     if not assets_hint.exists():
@@ -400,7 +580,7 @@ def main(argv: list[str] | None = None) -> int:
     if not preview_hint.exists():
         print(
             f"note: preview folder not found at {preview_hint}. "
-            "Fidelity mode needs preview/@2x.png for 1:1 visuals.",
+            "Local crops / gradient sampling need preview/@2x.png.",
             file=sys.stderr,
         )
     return 0

@@ -183,19 +183,35 @@ def _render_shape(
 def _render_container(
     node: LayoutNode, registry: ClassRegistry, prefix: str
 ) -> str:
+    mode = str(node.meta.get("layout_mode") or node.kind)
     decls: Dict[str, str] = {
-        "display": "flex",
-        "flex-direction": "row" if node.direction == "row" else "column",
         "position": "relative",
         "box-sizing": "border-box",
         "flex-shrink": "0",
     }
+
+    if mode == "grid" or node.kind == "grid":
+        cols = int(node.meta.get("grid_columns") or 2)
+        gap = float(node.meta.get("grid_gap") or node.gap or 0)
+        decls["display"] = "grid"
+        decls["grid-template-columns"] = f"repeat({cols}, 1fr)"
+        if gap > 0:
+            decls["gap"] = _rpx(gap)
+    elif mode == "overlay" or node.kind == "overlay":
+        decls["display"] = "block"
+    else:
+        decls["display"] = "flex"
+        decls["flex-direction"] = (
+            "row" if node.direction == "row" or node.kind == "row" else "column"
+        )
+
+    bg = str(node.meta.get("background") or "#EFF4FB")
     if node.kind == "artboard":
         decls["width"] = _rpx(node.width)
         decls["min-height"] = _rpx(node.height)
         decls["height"] = _rpx(node.height)
         decls["overflow"] = "hidden"
-        decls["background"] = "#EFF4FB"
+        decls["background"] = bg
     else:
         decls["width"] = _rpx(node.width)
         decls["height"] = _rpx(node.height)
@@ -204,17 +220,29 @@ def _render_container(
         else:
             decls.update(_flow_decls_rpx(node))
 
-    if node.layer:
+    if node.layer and not node.meta.get("suppress_fill"):
         decls.update(layer_visual_styles(node.layer, unit="rpx"))
+        sampled = node.meta.get("sampled_gradient")
+        if sampled:
+            decls["background-image"] = str(sampled)
+            decls.pop("background", None)
 
     decls["position"] = "relative"
-    prefix_name = {"artboard": "page", "group": "group", "row": "row"}.get(
-        node.kind, "box"
-    )
+    prefix_name = {
+        "artboard": "page",
+        "group": "group",
+        "row": "row",
+        "grid": "grid",
+        "overlay": "overlay",
+    }.get(node.kind, "box")
     cls = registry.add(prefix_name, decls)
-    flow = [c for c in node.children if c.kind != "asset"]
-    assets = [c for c in node.children if c.kind == "asset"]
-    ordered = flow + assets
+
+    def sort_key(c: LayoutNode) -> tuple:
+        if c.is_absolute or c.kind == "asset":
+            return (1, c.z_index)
+        return (0, c.z_index)
+
+    ordered = sorted(node.children, key=sort_key)
     inner = "\n".join(render_node_wxml(child, registry, prefix) for child in ordered)
     if inner:
         inner = "\n".join("  " + line for line in inner.splitlines())
@@ -231,6 +259,7 @@ def generate_miniprogram_files(
     registry = ClassRegistry()
     wxml = render_node_wxml(tree, registry, asset_url_prefix)
     wxss = registry.stylesheet()
+    page_bg = str(tree.meta.get("background") or "#EFF4FB")
     js = (
         f"Page({{\n"
         f"  data: {{\n"
@@ -249,7 +278,7 @@ def generate_miniprogram_files(
     return {
         f"{page_name}.wxml": wxml + "\n",
         f"{page_name}.wxss": (
-            "page {\n  background: #EFF4FB;\n}\n\n" + wxss + "\n"
+            f"page {{\n  background: {page_bg};\n}}\n\n" + wxss + "\n"
         ),
         f"{page_name}.js": js,
         f"{page_name}.json": json_cfg + "\n",
@@ -284,15 +313,16 @@ def export_miniprogram(
                 "navigationBarTitleText": artboard.name,
                 "navigationBarBackgroundColor": "#ffffff",
                 "navigationBarTextStyle": "black",
-                "backgroundColor": "#EFF4FB",
+                "backgroundColor": str(tree.meta.get("background") or "#EFF4FB"),
             },
         }
         (out_dir / "app.json").write_text(
             json.dumps(app_json, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        page_bg = str(tree.meta.get("background") or "#EFF4FB")
         (out_dir / "app.wxss").write_text(
-            "page { background: #EFF4FB; }\n", encoding="utf-8"
+            f"page {{ background: {page_bg}; }}\n", encoding="utf-8"
         )
         (out_dir / "project.config.json").write_text(
             json.dumps(

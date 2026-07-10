@@ -207,20 +207,36 @@ def _render_shape(
 def _render_container(
     node: LayoutNode, registry: ClassRegistry, prefix: str
 ) -> str:
+    mode = str(node.meta.get("layout_mode") or node.kind)
     decls: Dict[str, str] = {
-        "display": "flex",
-        "flex-direction": "row" if node.direction == "row" else "column",
         "position": "relative",
         "box-sizing": "border-box",
         "flex-shrink": "0",
     }
+
+    if mode == "grid" or node.kind == "grid":
+        cols = int(node.meta.get("grid_columns") or 2)
+        gap = float(node.meta.get("grid_gap") or node.gap or 0)
+        decls["display"] = "grid"
+        decls["grid-template-columns"] = f"repeat({cols}, 1fr)"
+        if gap > 0:
+            decls["gap"] = _px(gap)
+    elif mode == "overlay" or node.kind == "overlay":
+        decls["display"] = "block"
+    else:
+        decls["display"] = "flex"
+        decls["flex-direction"] = "row" if node.direction == "row" or node.kind == "row" else "column"
+        if node.gap and node.gap > 0 and node.kind in ("row", "group"):
+            # Prefer explicit margins for coordinate fidelity; gap is optional hint
+            pass
+
     if node.kind == "artboard":
         decls["width"] = _px(node.width)
         decls["min-height"] = _px(node.height)
         decls["height"] = _px(node.height)
         decls["margin"] = "0 auto"
         decls["overflow"] = "hidden"
-        decls["background"] = "#EFF4FB"
+        decls["background"] = str(node.meta.get("background") or "#EFF4FB")
     else:
         decls["width"] = _px(node.width)
         decls["height"] = _px(node.height)
@@ -229,23 +245,35 @@ def _render_container(
         else:
             decls.update(_flow_decls(node))
 
-    if node.layer:
+    if node.layer and not node.meta.get("suppress_fill"):
         decls.update(layer_visual_styles(node.layer, unit="px"))
+        sampled = node.meta.get("sampled_gradient")
+        if sampled:
+            decls["background-image"] = str(sampled)
+            decls.pop("background", None)
 
     decls["position"] = "relative"
-    prefix_name = {"artboard": "page", "group": "group", "row": "row"}.get(
-        node.kind, "box"
-    )
+    prefix_name = {
+        "artboard": "page",
+        "group": "group",
+        "row": "row",
+        "grid": "grid",
+        "overlay": "overlay",
+    }.get(node.kind, "box")
     cls = registry.add(prefix_name, decls)
-    # Paint order: flow first (document order), assets last so they overlay
-    flow = [c for c in node.children if c.kind != "asset"]
-    assets = [c for c in node.children if c.kind == "asset"]
-    ordered = flow + assets
+
+    # Document order for flow; absolute/assets keep z-index from layout
+    def sort_key(c: LayoutNode) -> tuple:
+        if c.is_absolute or c.kind == "asset":
+            return (1, c.z_index)
+        return (0, c.z_index)
+
+    ordered = sorted(node.children, key=sort_key)
     inner = "\n".join(render_node_html(child, registry, prefix) for child in ordered)
     if inner:
         inner = "\n".join("  " + line for line in inner.splitlines())
-        return f'<div class="{cls}">\n{inner}\n</div>'
-    return f'<div class="{cls}"></div>'
+        return f'<div class="{cls}" data-kind="{html.escape(node.kind)}">\n{inner}\n</div>'
+    return f'<div class="{cls}" data-kind="{html.escape(node.kind)}"></div>'
 
 
 def generate_html_page(

@@ -11,12 +11,22 @@ from .parser import Artboard, MeaXureDocument
 
 
 def find_preview_path(doc: MeaXureDocument, artboard: Artboard) -> Optional[Path]:
+    from .fidelity import resolve_preview_path
+
+    exact = resolve_preview_path(doc, artboard)
+    if exact is not None:
+        return exact
     if artboard.image_path:
         candidate = doc.source_path.parent / artboard.image_path
         if candidate.exists():
             return candidate
     preview_root = doc.preview_dir
     if preview_root.exists():
+        # Prefer filename match against artboard imagePath
+        if artboard.image_path:
+            want = Path(artboard.image_path).name
+            for match in preview_root.rglob(want):
+                return match
         matches = sorted(preview_root.rglob("*@2x.png"))
         if matches:
             return matches[0]

@@ -187,27 +187,28 @@ def apply_sampled_gradients(
     except ImportError:
         return {}
 
-    img = Image.open(preview_path)
     out: Dict[str, str] = {}
-    for layer in layers:
-        if not layer_has_gradient(layer):
-            continue
-        # Only opaque fills — translucent glass must keep rgba compositing
-        opaque = True
-        for f in layer.fills or []:
-            if f.get("fillType") != "Gradient":
+    with Image.open(preview_path) as img:
+        rgba = img.convert("RGBA")
+        for layer in layers:
+            if not layer_has_gradient(layer):
                 continue
-            for s in f.get("gradient", {}).get("colorStops") or []:
-                try:
-                    if float((s.get("color") or {}).get("alpha", 255)) < 250:
+            # Only opaque fills — translucent glass must keep rgba compositing
+            opaque = True
+            for f in layer.fills or []:
+                if f.get("fillType") != "Gradient":
+                    continue
+                for s in f.get("gradient", {}).get("colorStops") or []:
+                    try:
+                        if float((s.get("color") or {}).get("alpha", 255)) < 250:
+                            opaque = False
+                    except (TypeError, ValueError):
                         opaque = False
-                except (TypeError, ValueError):
-                    opaque = False
-        if not opaque:
-            continue
-        if min(layer.rect.width, layer.rect.height) < 40:
-            continue
-        css = sample_linear_gradient_css(img, artboard, layer, stops=24, inset=0.02)
-        if css:
-            out[layer.object_id] = css
+            if not opaque:
+                continue
+            if min(layer.rect.width, layer.rect.height) < 40:
+                continue
+            css = sample_linear_gradient_css(rgba, artboard, layer, stops=24, inset=0.02)
+            if css:
+                out[layer.object_id] = css
     return out
