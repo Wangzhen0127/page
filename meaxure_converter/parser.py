@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import unquote
 
 
 DATA_RE = re.compile(r"let\s+data\s*=\s*(\{.*?\});\s*(?:\n|$)", re.DOTALL)
@@ -90,12 +91,13 @@ class Layer:
     def primary_asset(self) -> Optional[Exportable]:
         if not self.exportable:
             return None
-        # Prefer @2x png, then webp, then first
+        # Prefer @2x png, then any @2x, then webp/png, then first
         ranked = sorted(
             self.exportable,
             key=lambda e: (
                 0 if "@2x" in e.path else 1,
-                0 if e.format.lower() in ("png", "webp", "jpg", "jpeg") else 2,
+                0 if e.format.lower() == "png" else 1,
+                0 if e.format.lower() in ("webp", "jpg", "jpeg") else 2,
                 e.path,
             ),
         )
@@ -192,7 +194,7 @@ def _parse_artboard(d: Dict[str, Any]) -> Artboard:
         width=float(d.get("width", 0) or 0),
         height=float(d.get("height", 0) or 0),
         page_name=str(d.get("pageName", "")),
-        image_path=d.get("imagePath"),
+        image_path=unquote(d["imagePath"]) if d.get("imagePath") else None,
         layers=layers,
         notes=list(d.get("notes") or []),
     )

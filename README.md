@@ -1,110 +1,80 @@
 # MeaXure Converter
 
-将 **Sketch MeaXure Web Export** 导出的 `index.html` 转成：
+将 **Sketch MeaXure Web Export** 的 `index.html` 转成：
 
-- 原生 **HTML** 页面
-- 原生 **微信小程序** 页面（WXML / WXSS / JS / JSON）
+- 原生 **HTML**（**每个画板一页**）
+- 原生 **微信小程序**（每个画板一个 page）
 
-## 设计原则
+## 重要：多画板
 
-| 类型 | 定位方式 |
-|------|----------|
-| 结构层（文本、矩形、椭圆等） | 画板为 **column flex**；每层 `margin-top = y - prev_bottom`（可负）、`margin-left = x`，用弹性布局还原绝对坐标 |
-| 切片素材（slice / exportable） | **原始坐标 absolute**（相对画板） |
-| 复杂矢量 / 位图占位 | 从 MeaXure `preview/@2x` 按 rect **裁切**补全（CSS 无法表达的路径） |
-| 不透明线性渐变 | 从 preview **多段采样**生成 CSS（24 stops），逼近 Sketch 渲染 |
-| 半透明玻璃渐变 | 保留原始 rgba stops，避免错误合成 |
-| 1x 切片图标 | Lanczos 放大为 `@2x` PNG，保留透明通道 |
+MeaXure 一个 `index.html` 里常有多个 artboard（本仓库 `关怀版/` 有 **19** 个）。  
+默认会 **全部导出**，不再合成成一个页面。
 
-目标：视觉位置尽量 1:1；结构层不用 absolute，素材保留原始定位。
+`links/*.html` 对应 MeaXure 的 `#index` 跳转；转换后用画板 `slug` 作为独立页面名。
 
-## 输入要求
+## 默认模式：`fidelity`（1:1）
 
-MeaXure 导出目录大致如下：
+视觉以 MeaXure `preview/**/@2x.png` 为准，整页铺满，保证与设计稿像素一致。  
+同时拷贝 `assets/` 切图，方便开发替换/拆分。
 
-```text
-your-export/
-  index.html          # 内含 `let data = {...}`
-  assets/             # 切片图片（webp/png）
-  preview/            # 可选预览图
-```
+| 资源 | 用途 |
+|------|------|
+| `preview/@2x.png` | 页面视觉 1:1 底图 |
+| `assets/*` 切图 | 开发素材；难还原处直接用切图 |
+| `links/*.html` | 画板索引参考（`#N`） |
 
-本工具只依赖 `index.html` 里的 `data`；若旁边有 `assets/`，会自动拷贝到输出目录。
-
-## 安装
-
-```bash
-cd /path/to/page
-pip install -e .
-# 或直接：
-python -m meaxure_converter --help
-```
+可选 `--mode flex`：用图层 flex+margin 重建（适合二次改版，还原度低于 fidelity）。
 
 ## 用法
 
 ```bash
-# 同时输出 HTML + 小程序
-python -m meaxure_converter path/to/index.html -o output
+pip install -r requirements.txt
 
-# 只出 HTML
-python -m meaxure_converter path/to/index.html -o output -f html
+# 列出全部画板 + preview 是否齐全
+python -m meaxure_converter 关怀版/index.html --list
 
-# 只出微信小程序
-python -m meaxure_converter path/to/index.html -o output -f miniprogram
+# 默认：全部画板 → HTML + 小程序（fidelity 1:1）
+python -m meaxure_converter 关怀版/index.html -o output/guanhuai
 
-# 列出画板
-python -m meaxure_converter path/to/index.html --list
+# 只转某一个画板
+python -m meaxure_converter 关怀版/index.html -o out -a 1
 
-# 指定画板下标
-python -m meaxure_converter path/to/index.html -a 0 -f both
+# 只要 HTML / 只要小程序
+python -m meaxure_converter 关怀版/index.html -o out -f html
+python -m meaxure_converter 关怀版/index.html -o out -f miniprogram
+
+# 旧的 flex 重建模式
+python -m meaxure_converter 关怀版/index.html -o out --mode flex -a 0
 ```
 
-### 输出结构
+### 输出结构（fidelity）
 
 ```text
-output/
+output/guanhuai/
   html/
-    index.html
-    assets/...
+    index.html              # 画板画廊入口
+    pages/<slug>.html       # 每个画板一页
+    assets/
+      preview_<slug>@2x.png # 该页 1:1 预览图
+      ...切图...
   miniprogram/
-    app.js / app.json / app.wxss
-    project.config.json
-    pages/index/index.{wxml,wxss,js,json}
+    app.js / app.json / ...
+    pages/<slug>/           # 每个画板一个小程序页
     assets/...
 ```
 
-小程序可直接用微信开发者工具打开 `output/miniprogram`。
+打开 `output/guanhuai/html/index.html` 可浏览全部页面。
 
-## 示例
-
-仓库内 `samples/meaxure-index.html` 为精简样例（来自 MeaXure 导出数据）：
-
-```bash
-python -m meaxure_converter samples/meaxure-index.html -o output
-python -m unittest discover -s tests -v
-```
-
-> 样例未附带真实 `assets/` 图片，转换后图片路径会保留，需把原导出目录的 `assets/` 放到 `samples/assets` 或输出目录中。
-
-## 模块说明
+## 输入目录要求
 
 ```text
-meaxure_converter/
-  parser.py           # 解析 let data = {...}
-  layout.py           # 分组树 + flex 行聚类 + 素材绝对定位
-  styles.py           # fills / borders / shadows / text → CSS/WXSS
-  html_gen.py         # 生成原生 HTML
-  miniprogram_gen.py  # 生成微信小程序
-  cli.py              # 命令行入口
+关怀版/
+  index.html
+  assets/          # 切图
+  preview/         # 各画板 @2x 预览（fidelity 必需）
+  links/           # 可选，MeaXure 页面跳转
+  proto.html
 ```
-
-## 限制与说明
-
-- MeaXure 图层列表是扁平的，父子关系靠 **group 包围盒** 推断，复杂蒙版/布尔运算无法 100% 还原。
-- 复杂矢量图标若已导出为 slice，会优先用图片素材，并抑制被切片覆盖的矢量层。
-- 渐变描边等能力按近似色处理。
-- 单位：HTML 用 `px`（按设计稿 750）；小程序用 `rpx`（750 设计宽 1:1）。
-- 字体依赖运行环境（如 PingFang SC）；小程序端需自行配置字体或回退。
 
 ## License
 
