@@ -200,7 +200,10 @@ def _render_shape(
         decls["background-image"] = f'url("{prefix.rstrip("/")}/{crop_src}")'
         decls["background-size"] = "100% 100%"
         decls["background-repeat"] = "no-repeat"
-        decls.pop("background", None)
+        # Component crops have transparent holes where editable text renders.
+        # Keep the original CSS fill beneath those holes.
+        if not node.meta.get("component_crop"):
+            decls.pop("background", None)
         for k in list(decls):
             if k.startswith("border"):
                 decls.pop(k, None)
@@ -394,7 +397,16 @@ def _apply_enhancements(
     crop_preview_layers(doc, artboard, tree, assets_dir)
     upgrade_assets_from_preview(doc, artboard, tree, assets_dir)
 
-    sampled = apply_sampled_gradients(doc, artboard, artboard.layers)
+    # Sampling from a flattened preview is safe only for broad backgrounds.
+    # Sampling card gradients picks up overlaid artwork/text and produces
+    # saturated blocks. Card gradients should use their original Sketch stops.
+    broad_backgrounds = [
+        layer
+        for layer in artboard.layers
+        if layer.rect.width >= artboard.width * 0.80
+        and layer.rect.height >= 80
+    ]
+    sampled = apply_sampled_gradients(doc, artboard, broad_backgrounds)
     if sampled:
 
         def walk(n: LayoutNode) -> None:

@@ -202,16 +202,27 @@ def _needs_preview_crop(
     """Strict crop gate: tiny hard vectors only, never large surfaces."""
     if layer.type != "shape" or layer.is_asset:
         return False
+    board_area = max(1.0, artboard.width * artboard.height)
+
+    name = layer.name or ""
+    bitmap_placeholder = any(k in name.lower() for k in ("位图", "banner", "图片", "image"))
+    area_ratio = _rect_area(layer.rect) / board_area
+
+    # MeaXure often exposes raster artwork only as a shape called 位图/banner.
+    # These are not CSS shapes: crop their local rectangle even when larger
+    # than icon limits. This restores hero banners and card illustrations
+    # without falling back to a full-page screenshot.
+    if bitmap_placeholder:
+        return area_ratio <= 0.10 and not _foreground_overlap(layer, layers, z)
+
     if layer.rect.width > MAX_CROP_SIDE or layer.rect.height > MAX_CROP_SIDE:
         return False
-    board_area = max(1.0, artboard.width * artboard.height)
-    if _rect_area(layer.rect) / board_area > MAX_CROP_AREA_RATIO:
+    if area_ratio > MAX_CROP_AREA_RATIO:
         return False
     if _foreground_overlap(layer, layers, z):
         return False
 
-    name = layer.name or ""
-    hard_name = any(k in name for k in ("路径", "形状结合", "蒙版", "位图", "banner", "图片"))
+    hard_name = any(k in name for k in ("路径", "形状结合", "蒙版"))
     generic_shape = "形状" in name and not hard_name and "椭圆" not in name
 
     if "椭圆" in name and layer.fills and not hard_name:
@@ -294,6 +305,75 @@ def _collect_layers(
     return out
 
 
+def _component_crop_candidates(
+    artboard: Artboard,
+    layers: Sequence[tuple[int, Layer]],
+) -> Dict[int, Dict[str, object]]:
+    """Find card-like raster composites.
+
+    MeaXure flattens card artwork into a background mask, decorative gradient
+    shapes and one or more bitmap placeholders. Rendering those independently
+    creates the large blue blocks seen in service cards. Crop only that card
+    rectangle, remove text pixels later, and keep editable HTML text above it.
+    """
+    candidates: Dict[int, Dict[str, object]] = {}
+    used_rects: List[Rect] = []
+    board_area = max(1.0, artboard.width * artboard.height)
+
+    for z, layer in layers:
+        r = layer.rect
+        name = layer.name or ""
+        if layer.type != "shape" or layer.is_asset:
+            continue
+        if not any(k in name for k in ("蒙版", "矩形")):
+            continue
+        if not (250 <= r.width <= 420 and 120 <= r.height <= 420):
+            continue
+        if _rect_area(r) / board_area > 0.10:
+            continue
+        if any(_almost_same_rect(r, prev, tol=2.0) for prev in used_rects):
+            continue
+
+        text_layers: List[Layer] = []
+        bitmap_layers: List[tuple[int, Layer]] = []
+        covered_visuals: List[int] = []
+        for child_z, child in layers:
+            if child_z == z:
+                continue
+            overlap = _overlap_area(r, child.rect)
+            if overlap <= 0:
+                continue
+            child_area = max(1.0, _rect_area(child.rect))
+            mostly_inside = overlap / child_area >= 0.60
+            if child.type == "text" and r.contains(child.rect, pad=3.0):
+                text_layers.append(child)
+                continue
+            child_name = (child.name or "").lower()
+            if (
+                child.type == "shape"
+                and any(k in child_name for k in ("位图", "banner", "图片", "image"))
+                and mostly_inside
+            ):
+                bitmap_layers.append((child_z, child))
+            if mostly_inside and child.type != "text":
+                covered_visuals.append(child_z)
+
+        if not text_layers or not bitmap_layers:
+            continue
+
+        used_rects.append(r)
+        candidates[z] = {
+            # Composite pixels include later decorations, but the crop itself
+            # stays at the original card-background z so editable text layers
+            # retain their original order and paint above it.
+            "paint_z": z,
+            "text_rects": [text.rect for text in text_layers],
+            "suppress_z": set(covered_visuals),
+            "component_crop": True,
+        }
+    return candidates
+
+
 def build_layout(
     artboard: Artboard,
     slices: Optional[Sequence[Layer]] = None,
@@ -302,6 +382,10 @@ def build_layout(
     slice_by_id = {s.object_id: s for s in (slices or []) if s.object_id}
     layers = _collect_layers(artboard, slice_by_id)
     bg = _infer_artboard_background(artboard, layers)
+    component_crops = _component_crop_candidates(artboard, layers)
+    suppressed_z: set[int] = set()
+    for info in component_crops.values():
+        suppressed_z.update(info["suppress_z"])  # type: ignore[arg-type]
 
     root = LayoutNode(
         kind="artboard",
@@ -318,6 +402,8 @@ def build_layout(
     )
 
     for z, layer in layers:
+        if z in suppressed_z and z not in component_crops:
+            continue
         if layer.type == "text":
             kind = "text"
         elif layer.is_asset:
@@ -326,7 +412,16 @@ def build_layout(
             kind = "shape"
 
         meta: Dict[str, object] = {"layout_mode": "absolute"}
-        if kind == "shape" and _needs_preview_crop(layer, layers, z, artboard):
+        component = component_crops.get(z)
+        node_z = z
+        if component:
+            meta.update(component)
+            meta["preview_crop"] = True
+            meta["crop_reason"] = "complex-card"
+            # Keep CSS fill beneath the crop; transparent text holes reveal it.
+            meta["suppress_fill"] = False
+            node_z = int(component["paint_z"])
+        elif kind == "shape" and _needs_preview_crop(layer, layers, z, artboard):
             meta["preview_crop"] = True
             meta["suppress_fill"] = True
             meta["crop_reason"] = layer.name or "complex-vector"
@@ -339,7 +434,7 @@ def build_layout(
             rect=layer.rect,
             layer=layer,
             class_name=kind,
-            z_index=z,
+            z_index=node_z,
             abs_left=layer.rect.x,
             abs_top=layer.rect.y,
             meta=meta,

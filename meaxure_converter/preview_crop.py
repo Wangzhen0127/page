@@ -36,10 +36,24 @@ def find_preview_path(doc: MeaXureDocument, artboard: Artboard) -> Optional[Path
     return None
 
 
-def _safe_crop_name(node: LayoutNode, index: int, prefix: str = "crop") -> str:
+def _safe_crop_name(
+    node: LayoutNode,
+    index: int,
+    page_token: str,
+    prefix: str = "crop",
+) -> str:
+    page = re.sub(
+        r"[^\w\u4e00-\u9fff-]+",
+        "_",
+        page_token or "page",
+        flags=re.UNICODE,
+    ).strip("_")
     raw = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", node.name or prefix, flags=re.UNICODE)
     raw = raw.strip("_") or prefix
-    return f"{prefix}_{index}_{raw}_{int(node.rect.x)}_{int(node.rect.y)}.png"
+    return (
+        f"{prefix}_{page}_{index}_{raw}_"
+        f"{int(node.rect.x)}_{int(node.rect.y)}.png"
+    )
 
 
 def _crop_box(im, artboard: Artboard, rect) -> Optional[Tuple[int, int, int, int]]:
@@ -83,6 +97,53 @@ def crop_preview_layers(
         if not box:
             continue
         crop = im.crop(box)
+        # Composite card crops keep text editable. Replace preview text with a
+        # locally blurred background patch, then HTML text renders above it.
+        # Transparency exposed a mismatched CSS gradient as white rectangles.
+        text_rects = node.meta.get("text_rects") or []
+        if node.meta.get("component_crop") and text_rects:
+            try:
+                from PIL import ImageFilter
+
+                sx = crop.width / max(1.0, node.rect.width)
+                sy = crop.height / max(1.0, node.rect.height)
+                # Heavy blur removes glyph silhouettes while retaining the
+                # card's broad local gradient.
+                blur_radius = max(28, int(round(28 * max(sx, sy))))
+                blurred = crop.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                for text_rect in text_rects:
+                    pad = 2.0
+                    left = max(
+                        0,
+                        int(round((text_rect.x - node.rect.x - pad) * sx)),
+                    )
+                    top = max(
+                        0,
+                        int(round((text_rect.y - node.rect.y - pad) * sy)),
+                    )
+                    right = min(
+                        crop.width,
+                        int(
+                            round(
+                                (text_rect.x + text_rect.width - node.rect.x + pad)
+                                * sx
+                            )
+                        ),
+                    )
+                    bottom = min(
+                        crop.height,
+                        int(
+                            round(
+                                (text_rect.y + text_rect.height - node.rect.y + pad)
+                                * sy
+                            )
+                        ),
+                    )
+                    if right > left and bottom > top:
+                        patch = blurred.crop((left, top, right, bottom))
+                        crop.paste(patch, (left, top))
+            except (AttributeError, TypeError, ValueError):
+                pass
         # Downscale to 1x display size for crisp CSS background-size:100% 100%
         target = (
             max(1, int(round(node.rect.width))),
@@ -96,7 +157,7 @@ def crop_preview_layers(
         elif crop.size != target:
             crop = crop.resize(target, Image.Resampling.LANCZOS)
 
-        fname = _safe_crop_name(node, i)
+        fname = _safe_crop_name(node, i, artboard.slug or artboard.object_id or artboard.name)
         crop.save(dest_assets / fname, optimize=True)
         node.meta["crop_src"] = fname
         results.append((node, fname))

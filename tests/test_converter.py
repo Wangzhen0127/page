@@ -53,7 +53,11 @@ class MeaXureConverterTests(unittest.TestCase):
             self.assertEqual(child.abs_top, child.rect.y)
             self.assertIsNotNone(child.layer)
             # z-index matches original paint order index
-            self.assertEqual(child.z_index, self.artboard.layers.index(child.layer))
+            original_z = self.artboard.layers.index(child.layer)
+            if child.meta.get("component_crop"):
+                self.assertGreaterEqual(child.z_index, original_z)
+            else:
+                self.assertEqual(child.z_index, original_z)
 
         # Children sorted by paint order
         zs = [c.z_index for c in self.tree.children]
@@ -85,11 +89,15 @@ class MeaXureConverterTests(unittest.TestCase):
         self.assertLess(stats["preview_crop"], visual)
         board_area = self.artboard.width * self.artboard.height
         for node in crops:
-            self.assertLessEqual(node.rect.width, 120.1)
-            self.assertLessEqual(node.rect.height, 120.1)
-            self.assertLessEqual(
-                node.rect.width * node.rect.height / board_area, 0.01 + 1e-9
-            )
+            name = (node.name or "").lower()
+            bitmap = any(k in name for k in ("位图", "banner", "图片", "image"))
+            area_ratio = node.rect.width * node.rect.height / board_area
+            if bitmap or node.meta.get("component_crop"):
+                self.assertLessEqual(area_ratio, 0.10 + 1e-9)
+            else:
+                self.assertLessEqual(node.rect.width, 120.1)
+                self.assertLessEqual(node.rect.height, 120.1)
+                self.assertLessEqual(area_ratio, 0.01 + 1e-9)
 
     def test_miniprogram_generation(self) -> None:
         files = generate_miniprogram_files(self.artboard, self.tree)
@@ -186,6 +194,26 @@ class MultiArtboardHybridTests(unittest.TestCase):
             assert layer is not None
             self.assertAlmostEqual(node.abs_left or -1, layer.rect.x, places=2)
             self.assertAlmostEqual(node.abs_top or -1, layer.rect.y, places=2)
+
+    def test_homepage_raster_placeholders_are_local_crops(self) -> None:
+        """Banner/card artwork may crop locally, never as a full page."""
+        ab = self.doc.artboards[0]
+        tree = build_layout(ab, self.doc.slices)
+        crops = iter_preview_crops(tree)
+        names = [node.name.lower() for node in crops]
+        self.assertTrue(any("banner" in name for name in names))
+        # The 210px family-doctor artwork is absorbed into a component crop,
+        # rather than independently rendered as a blue block.
+        self.assertTrue(
+            any(
+                node.meta.get("component_crop")
+                and node.rect.width >= 300
+                and node.rect.height >= 300
+                for node in crops
+            )
+        )
+        for node in crops:
+            self.assertLess(node.rect.width * node.rect.height, ab.width * ab.height)
 
 
 if __name__ == "__main__":
