@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="meaxure-converter",
-    version="1.1.0",
+    version="1.2.0",
     description="Convert Sketch MeaXure HTML exports to native HTML / WeChat Mini Program",
     packages=find_packages(),
     python_requires=">=3.9",
