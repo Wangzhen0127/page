@@ -32,9 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Convert Sketch MeaXure Web Export HTML into native HTML "
             "and/or WeChat Mini Program pages. "
-            "Default mode `hybrid` rebuilds editable DOM (text/colors/shapes) "
-            "with local absolute overlays; preview crops only for tiny hard "
-            "vectors. Use `fidelity` for full-page preview snapshots."
+            "Default mode `hybrid` rebuilds editable DOM with absolute "
+            "positioning from MeaXure rects (text/colors/shapes); preview "
+            "crops only for tiny hard vectors. Use `fidelity` for full-page "
+            "preview snapshots."
         ),
     )
     p.add_argument(
@@ -74,8 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("hybrid", "flex", "fidelity"),
         default="hybrid",
         help=(
-            "hybrid = editable CSS/DOM reconstruction (default); "
-            "flex = legacy flat margin chain; "
+            "hybrid = absolute-position editable CSS/DOM (default); "
+            "flex = alias of hybrid; "
             "fidelity = full-page preview image per artboard"
         ),
     )

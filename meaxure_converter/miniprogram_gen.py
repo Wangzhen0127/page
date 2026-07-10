@@ -97,8 +97,8 @@ def _render_asset(node: LayoutNode, registry: ClassRegistry, prefix: str) -> str
         src = f"{prefix.rstrip('/')}/{_safe_asset_filename(asset.path)}"
     decls = {
         "position": "absolute",
-        "left": _rpx(node.abs_left or 0),
-        "top": _rpx(node.abs_top or 0),
+        "left": _rpx(node.abs_left if node.abs_left is not None else node.rect.x),
+        "top": _rpx(node.abs_top if node.abs_top is not None else node.rect.y),
         "width": _rpx(node.width),
         "height": _rpx(node.height),
         "display": "block",
@@ -126,9 +126,11 @@ def _render_text(node: LayoutNode, registry: ClassRegistry) -> str:
         decls.update(_flow_decls_rpx(node))
     decls.update(layer_visual_styles(layer, unit="rpx"))
     decls.update(_z_decls(node))
-    decls.setdefault("display", "flex")
-    decls.setdefault("align-items", "center")
-    decls["position"] = "relative"
+    # Keep MeaXure text metrics; do NOT flex-center.
+    decls["display"] = "block"
+    decls["overflow"] = "hidden"
+    if not node.is_absolute:
+        decls["position"] = "relative"
     cls = registry.add("text", decls)
     content = _escape_text(layer.content or "").replace("\n", "\n")
     return f'<view class="{cls}">{content}</view>'
@@ -156,7 +158,8 @@ def _render_shape(
             if k in styles:
                 decls[k] = styles[k]
     decls.update(_z_decls(node))
-    decls["position"] = "relative"
+    if not node.is_absolute:
+        decls["position"] = "relative"
     decls.setdefault("display", "block")
     decls["overflow"] = "hidden"
 
@@ -185,22 +188,27 @@ def _render_container(
 ) -> str:
     mode = str(node.meta.get("layout_mode") or node.kind)
     decls: Dict[str, str] = {
-        "position": "relative",
         "box-sizing": "border-box",
         "flex-shrink": "0",
     }
 
-    if mode == "grid" or node.kind == "grid":
+    if node.kind == "artboard" or mode == "absolute":
+        decls["display"] = "block"
+        decls["position"] = "relative"
+    elif mode == "grid" or node.kind == "grid":
         cols = int(node.meta.get("grid_columns") or 2)
         gap = float(node.meta.get("grid_gap") or node.gap or 0)
         decls["display"] = "grid"
+        decls["position"] = "relative"
         decls["grid-template-columns"] = f"repeat({cols}, 1fr)"
         if gap > 0:
             decls["gap"] = _rpx(gap)
     elif mode == "overlay" or node.kind == "overlay":
         decls["display"] = "block"
+        decls["position"] = "relative"
     else:
         decls["display"] = "flex"
+        decls["position"] = "relative"
         decls["flex-direction"] = (
             "row" if node.direction == "row" or node.kind == "row" else "column"
         )
@@ -227,7 +235,6 @@ def _render_container(
             decls["background-image"] = str(sampled)
             decls.pop("background", None)
 
-    decls["position"] = "relative"
     prefix_name = {
         "artboard": "page",
         "group": "group",
@@ -237,18 +244,12 @@ def _render_container(
     }.get(node.kind, "box")
     cls = registry.add(prefix_name, decls)
 
-    def sort_key(c: LayoutNode) -> tuple:
-        if c.is_absolute or c.kind == "asset":
-            return (1, c.z_index)
-        return (0, c.z_index)
-
-    ordered = sorted(node.children, key=sort_key)
+    ordered = sorted(node.children, key=lambda c: c.z_index)
     inner = "\n".join(render_node_wxml(child, registry, prefix) for child in ordered)
     if inner:
         inner = "\n".join("  " + line for line in inner.splitlines())
         return f'<view class="{cls}">\n{inner}\n</view>'
     return f'<view class="{cls}"></view>'
-
 
 def generate_miniprogram_files(
     artboard: Artboard,

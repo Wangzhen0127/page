@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -36,29 +37,37 @@ class MeaXureConverterTests(unittest.TestCase):
         self.assertEqual(self.artboard.width, 750)
         self.assertGreater(len(self.artboard.layers), 20)
 
-    def test_hybrid_layout_has_structure(self) -> None:
+    def test_absolute_layout_preserves_coords(self) -> None:
         counts = count_nodes(self.tree)
         self.assertGreater(counts.get("text", 0) + counts.get("shape", 0), 0)
-        # Nested containers should appear for real designs
-        self.assertGreaterEqual(
-            counts.get("group", 0)
-            + counts.get("row", 0)
-            + counts.get("overlay", 0)
-            + counts.get("grid", 0),
-            0,
-        )
-        # Page height preserved via spacer or content bottom
-        bottoms = []
+        # Flat absolute tree: no inferred flex containers
+        self.assertEqual(counts.get("group", 0), 0)
+        self.assertEqual(counts.get("row", 0), 0)
+        self.assertEqual(counts.get("grid", 0), 0)
+        self.assertEqual(counts.get("overlay", 0), 0)
+
+        # Every leaf uses original MeaXure rect as absolute coords
         for child in self.tree.children:
-            bottoms.append(child.rect.y + child.rect.height)
-        self.assertGreaterEqual(max(bottoms), self.artboard.height - 2.0)
+            self.assertTrue(child.is_absolute, msg=child.name)
+            self.assertEqual(child.abs_left, child.rect.x)
+            self.assertEqual(child.abs_top, child.rect.y)
+            self.assertIsNotNone(child.layer)
+            # z-index matches original paint order index
+            self.assertEqual(child.z_index, self.artboard.layers.index(child.layer))
+
+        # Children sorted by paint order
+        zs = [c.z_index for c in self.tree.children]
+        self.assertEqual(zs, sorted(zs))
 
     def test_no_full_page_preview_in_html(self) -> None:
         html = generate_html_page(self.artboard, self.tree)
         self.assertIn("<!DOCTYPE html>", html)
         self.assertNotIn("page-preview", html)
         self.assertIn("data-kind=", html)
-        # Text content should be editable in DOM
+        self.assertIn("position: absolute", html)
+        # Text must not use flex centering
+        self.assertNotRegex(html, r"\.text-\d+\s*\{[^}]*align-items:\s*center")
+        # Editable text present
         self.assertTrue(
             any(
                 (layer.content or "").strip() and (layer.content or "") in html
@@ -73,17 +82,21 @@ class MeaXureConverterTests(unittest.TestCase):
         code = stats["text"] + stats["css_shape"]
         visual = code + stats["asset"] + stats["preview_crop"]
         self.assertGreater(visual, 0)
-        # Must not crop everything
         self.assertLess(stats["preview_crop"], visual)
+        board_area = self.artboard.width * self.artboard.height
         for node in crops:
             self.assertLessEqual(node.rect.width, 120.1)
             self.assertLessEqual(node.rect.height, 120.1)
+            self.assertLessEqual(
+                node.rect.width * node.rect.height / board_area, 0.01 + 1e-9
+            )
 
     def test_miniprogram_generation(self) -> None:
         files = generate_miniprogram_files(self.artboard, self.tree)
         self.assertIn("index.wxml", files)
         self.assertIn("rpx", files["index.wxss"])
         self.assertNotIn("page-preview", files["index.wxml"])
+        self.assertIn("position: absolute", files["index.wxss"])
 
 
 class MultiArtboardHybridTests(unittest.TestCase):
@@ -106,17 +119,27 @@ class MultiArtboardHybridTests(unittest.TestCase):
             import shutil
 
             shutil.rmtree(out)
+        # Use a form-like artboard that previously broke with flex inference
         code = cli_main(
-            [str(REAL_FULL), "-o", str(out), "-f", "html", "--mode", "hybrid", "-a", "1"]
+            [str(REAL_FULL), "-o", str(out), "-f", "html", "--mode", "hybrid", "-a", "2"]
         )
         self.assertEqual(code, 0)
         pages = list((out / "html" / "pages").glob("*.html"))
         self.assertEqual(len(pages), 1)
         html = pages[0].read_text(encoding="utf-8")
         self.assertNotIn("page-preview", html)
-        self.assertIn("data-kind=", html)
-        # Should contain real text from the artboard
-        self.assertTrue("海淀" in html or "首页" in html or "签约" in html)
+        self.assertIn("position: absolute", html)
+        self.assertIn("data-kind=\"artboard\"", html)
+        # No nested flex containers from failed inference
+        self.assertNotIn("data-kind=\"group\"", html)
+        self.assertNotIn("data-kind=\"row\"", html)
+        # Real text from the artboard
+        self.assertTrue(
+            "签约" in html or "机构" in html or "团队" in html or "中关村" in html
+        )
+        # Absolute left/top present for leaves
+        self.assertRegex(html, r"left:\s*\d")
+        self.assertRegex(html, r"top:\s*\d")
 
     def test_cli_hybrid_exports_all_artboards(self) -> None:
         out = ROOT / "output" / "test_hybrid_all"
@@ -135,7 +158,8 @@ class MultiArtboardHybridTests(unittest.TestCase):
         for page in pages[:3]:
             body = page.read_text(encoding="utf-8")
             self.assertNotIn("page-preview", body)
-            self.assertIn("data-kind=", body)
+            self.assertIn("position: absolute", body)
+            self.assertNotIn("data-kind=\"group\"", body)
 
     def test_cli_fidelity_still_available(self) -> None:
         out = ROOT / "output" / "test_fidelity"
@@ -151,6 +175,17 @@ class MultiArtboardHybridTests(unittest.TestCase):
         self.assertEqual(len(pages), 1)
         html = pages[0].read_text(encoding="utf-8")
         self.assertIn("page-preview", html)
+
+    def test_absolute_coords_match_meaxure_rect(self) -> None:
+        ab = self.doc.artboards[2]
+        tree = build_layout(ab, self.doc.slices)
+        texts = [c for c in tree.children if c.kind == "text"]
+        self.assertGreater(len(texts), 0)
+        for node in texts[:5]:
+            layer = node.layer
+            assert layer is not None
+            self.assertAlmostEqual(node.abs_left or -1, layer.rect.x, places=2)
+            self.assertAlmostEqual(node.abs_top or -1, layer.rect.y, places=2)
 
 
 if __name__ == "__main__":

@@ -119,8 +119,8 @@ def _render_asset(node: LayoutNode, registry: ClassRegistry, prefix: str) -> str
         src = f"{prefix.rstrip('/')}/{_safe_asset_filename(asset.path)}"
     decls = {
         "position": "absolute",
-        "left": _px(node.abs_left or 0),
-        "top": _px(node.abs_top or 0),
+        "left": _px(node.abs_left if node.abs_left is not None else node.rect.x),
+        "top": _px(node.abs_top if node.abs_top is not None else node.rect.y),
         "width": _px(node.width),
         "height": _px(node.height),
         "display": "block",
@@ -139,7 +139,11 @@ def _render_asset(node: LayoutNode, registry: ClassRegistry, prefix: str) -> str
         decls["transform"] = f"rotate({layer.rotation}deg)"
     cls = registry.add("asset", decls)
     alt = html.escape(layer.name or "")
-    return f'<img class="{cls}" src="{html.escape(src)}" alt="{alt}" />'
+    oid = html.escape(layer.object_id or "")
+    return (
+        f'<img class="{cls}" src="{html.escape(src)}" alt="{alt}" '
+        f'data-kind="asset" data-oid="{oid}" />'
+    )
 
 
 def _render_text(node: LayoutNode, registry: ClassRegistry) -> str:
@@ -152,12 +156,15 @@ def _render_text(node: LayoutNode, registry: ClassRegistry) -> str:
         decls.update(_flow_decls(node))
     decls.update(layer_visual_styles(layer, unit="px"))
     decls.update(_z_decls(node))
-    decls.setdefault("display", "flex")
-    decls.setdefault("align-items", "center")
-    decls["position"] = "relative"
+    # Keep MeaXure text metrics; do NOT flex-center (distorts line boxes).
+    decls["display"] = "block"
+    decls["overflow"] = "hidden"
+    if not node.is_absolute:
+        decls["position"] = "relative"
     cls = registry.add("text", decls)
+    oid = html.escape(layer.object_id or "")
     content = html.escape(layer.content or "").replace("\n", "<br />")
-    return f'<div class="{cls}">{content}</div>'
+    return f'<div class="{cls}" data-kind="text" data-oid="{oid}">{content}</div>'
 
 
 def _render_shape(
@@ -183,7 +190,8 @@ def _render_shape(
             if k in styles:
                 decls[k] = styles[k]
     decls.update(_z_decls(node))
-    decls["position"] = "relative"
+    if not node.is_absolute:
+        decls["position"] = "relative"
     decls.setdefault("display", "block")
     decls["overflow"] = "hidden"
 
@@ -193,15 +201,13 @@ def _render_shape(
         decls["background-size"] = "100% 100%"
         decls["background-repeat"] = "no-repeat"
         decls.pop("background", None)
-        # Drop CSS border when using a pixel-perfect crop
         for k in list(decls):
             if k.startswith("border"):
                 decls.pop(k, None)
-        cls = registry.add("shape", decls)
-        return f'<div class="{cls}" title="{html.escape(layer.name or "")}"></div>'
-
     cls = registry.add("shape", decls)
-    return f'<div class="{cls}" title="{html.escape(layer.name or "")}"></div>'
+    oid = html.escape(layer.object_id or "")
+    title = html.escape(layer.name or "")
+    return f'<div class="{cls}" data-kind="shape" data-oid="{oid}" title="{title}"></div>'
 
 
 def _render_container(
@@ -209,26 +215,30 @@ def _render_container(
 ) -> str:
     mode = str(node.meta.get("layout_mode") or node.kind)
     decls: Dict[str, str] = {
-        "position": "relative",
         "box-sizing": "border-box",
         "flex-shrink": "0",
     }
 
-    if mode == "grid" or node.kind == "grid":
+    if node.kind == "artboard" or mode == "absolute":
+        decls["display"] = "block"
+        decls["position"] = "relative"
+    elif mode == "grid" or node.kind == "grid":
         cols = int(node.meta.get("grid_columns") or 2)
         gap = float(node.meta.get("grid_gap") or node.gap or 0)
         decls["display"] = "grid"
+        decls["position"] = "relative"
         decls["grid-template-columns"] = f"repeat({cols}, 1fr)"
         if gap > 0:
             decls["gap"] = _px(gap)
     elif mode == "overlay" or node.kind == "overlay":
         decls["display"] = "block"
+        decls["position"] = "relative"
     else:
         decls["display"] = "flex"
-        decls["flex-direction"] = "row" if node.direction == "row" or node.kind == "row" else "column"
-        if node.gap and node.gap > 0 and node.kind in ("row", "group"):
-            # Prefer explicit margins for coordinate fidelity; gap is optional hint
-            pass
+        decls["position"] = "relative"
+        decls["flex-direction"] = (
+            "row" if node.direction == "row" or node.kind == "row" else "column"
+        )
 
     if node.kind == "artboard":
         decls["width"] = _px(node.width)
@@ -252,7 +262,6 @@ def _render_container(
             decls["background-image"] = str(sampled)
             decls.pop("background", None)
 
-    decls["position"] = "relative"
     prefix_name = {
         "artboard": "page",
         "group": "group",
@@ -262,13 +271,8 @@ def _render_container(
     }.get(node.kind, "box")
     cls = registry.add(prefix_name, decls)
 
-    # Document order for flow; absolute/assets keep z-index from layout
-    def sort_key(c: LayoutNode) -> tuple:
-        if c.is_absolute or c.kind == "asset":
-            return (1, c.z_index)
-        return (0, c.z_index)
-
-    ordered = sorted(node.children, key=sort_key)
+    # Preserve MeaXure paint order (z_index ascending).
+    ordered = sorted(node.children, key=lambda c: c.z_index)
     inner = "\n".join(render_node_html(child, registry, prefix) for child in ordered)
     if inner:
         inner = "\n".join("  " + line for line in inner.splitlines())
@@ -286,6 +290,8 @@ def generate_html_page(
     body = render_node_html(tree, registry, asset_url_prefix)
     css = registry.stylesheet()
     page_title = html.escape(title or artboard.name)
+    design_w = int(round(artboard.width)) or 750
+    design_h = int(round(artboard.height)) or 0
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -303,11 +309,40 @@ html, body {{
   text-rendering: geometricPrecision;
 }}
 img {{ max-width: none; }}
+.stage {{
+  width: 100%;
+  overflow: hidden;
+}}
+.stage-inner {{
+  width: {design_w}px;
+  height: {design_h}px;
+  transform-origin: top left;
+}}
 {css}
   </style>
 </head>
 <body>
+<div class="stage">
+  <div class="stage-inner" id="stage-inner">
 {body}
+  </div>
+</div>
+<script>
+(function () {{
+  var designW = {design_w};
+  var designH = {design_h};
+  var inner = document.getElementById("stage-inner");
+  var stage = inner && inner.parentElement;
+  function fit() {{
+    if (!inner || !stage) return;
+    var scale = Math.min(1, stage.clientWidth / designW);
+    inner.style.transform = "scale(" + scale + ")";
+    stage.style.height = (designH * scale) + "px";
+  }}
+  fit();
+  window.addEventListener("resize", fit);
+}})();
+</script>
 </body>
 </html>
 """

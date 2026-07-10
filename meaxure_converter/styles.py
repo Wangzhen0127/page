@@ -255,6 +255,8 @@ def layer_visual_styles(layer: Layer, unit: str = "px") -> Dict[str, str]:
             styles["font-weight"] = weight
         styles["white-space"] = "pre-wrap"
         styles["word-break"] = "break-word"
+        # Absolute text boxes should not flex-center; keep Sketch metrics.
+        styles["display"] = "block"
 
     return styles
 
